@@ -1,0 +1,3003 @@
+﻿===== DecoderBlock.ipynb =====
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "source": [
+        "import torch\n",
+        "import math\n",
+        "from torch import nn\n",
+        "import torch.nn.functional as F\n"
+      ],
+      "metadata": {
+        "id": "MLjkaLNSkeLU"
+      },
+      "execution_count": 2,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "These imports bring in:\n",
+        "\n",
+        "torch â€“ the PyTorch library for tensor operations.\n",
+        "\n",
+        "math â€“ used for mathematical constants and functions (e.g., square root).\n",
+        "\n",
+        "nn â€“ PyTorchâ€™s neural network module, where all layers and models come from.\n",
+        "\n",
+        "F â€“ gives access to functions like softmax and activation operations."
+      ],
+      "metadata": {
+        "id": "_c08VmzTkU-8"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def scaled_dot_product(q, k, v, mask=None):\n",
+        "    d_k = q.size()[-1]\n",
+        "    scaled = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(d_k)\n",
+        "    if mask is not None:\n",
+        "        scaled += mask\n",
+        "    attention = F.softmax(scaled, dim=-1)\n",
+        "    values = torch.matmul(attention, v)\n",
+        "    return values, attention\n"
+      ],
+      "metadata": {
+        "id": "D8Er3biNke2T"
+      },
+      "execution_count": 3,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Purpose: Compute attention scores between queries (Q), keys (K), and values (V).\n",
+        "\n",
+        "q, k, v shapes: [batch, heads, seq_len, head_dim].\n",
+        "\n",
+        "Scaling: Divide by âˆšd_k to stabilize gradients.\n",
+        "\n",
+        "Masking: Adds large negative numbers (-inf) to prevent attending to future tokens.\n",
+        "\n",
+        "Softmax: Converts scores into probabilities.\n",
+        "\n",
+        "Weighted sum: Applies attention weights to values (V).\n",
+        "\n",
+        "Output: Returns the attended values and attention map"
+      ],
+      "metadata": {
+        "id": "dbeREyaYkaor"
+      }
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 4,
+      "metadata": {
+        "id": "jVJwreSJkKIA"
+      },
+      "outputs": [],
+      "source": [
+        "class PositionwiseFeedForward(nn.Module):\n",
+        "    def __init__(self, d_model, hidden, drop_prob=0.1):\n",
+        "        super().__init__()\n",
+        "        self.linear1 = nn.Linear(d_model, hidden)\n",
+        "        self.linear2 = nn.Linear(hidden, d_model)\n",
+        "        self.relu = nn.ReLU()\n",
+        "        self.dropout = nn.Dropout(p=drop_prob)\n",
+        "\n",
+        "    def forward(self, x):\n",
+        "        x = self.linear1(x)\n",
+        "        x = self.relu(x)\n",
+        "        x = self.dropout(x)\n",
+        "        x = self.linear2(x)\n",
+        "        return x\n"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Applies two linear transformations with a ReLU in between.\n",
+        "\n",
+        "Expands from 512 â†’ 2048 â†’ 512.\n",
+        "\n",
+        "Adds nonlinearity and dropout for better generalization.\n",
+        "\n",
+        "Operates independently on each position (hence â€œposition-wiseâ€)."
+      ],
+      "metadata": {
+        "id": "28rxUe-UknIT"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class LayerNormalization(nn.Module):\n",
+        "    def __init__(self, parameters_shape, eps=1e-5):\n",
+        "        super().__init__()\n",
+        "        self.gamma = nn.Parameter(torch.ones(parameters_shape))\n",
+        "        self.beta = nn.Parameter(torch.zeros(parameters_shape))\n",
+        "        self.eps = eps\n",
+        "\n",
+        "    def forward(self, inputs):\n",
+        "        mean = inputs.mean(dim=-1, keepdim=True)\n",
+        "        var = ((inputs - mean) ** 2).mean(dim=-1, keepdim=True)\n",
+        "        std = (var + self.eps).sqrt()\n",
+        "        y = (inputs - mean) / std\n",
+        "        out = self.gamma * y + self.beta\n",
+        "        return out\n"
+      ],
+      "metadata": {
+        "id": "NB6l6X3Jk1_M"
+      },
+      "execution_count": 5,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Normalizes each feature across the last dimension (e.g., embedding size).\n",
+        "\n",
+        "Gamma and Beta allow rescaling and shifting after normalization.\n",
+        "\n",
+        "Prevents internal covariate shift, helping stabilize training."
+      ],
+      "metadata": {
+        "id": "G-oZPM0hktS8"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class MultiHeadAttention(nn.Module):\n",
+        "    def __init__(self, d_model, num_heads):\n",
+        "        super().__init__()\n",
+        "        self.d_model = d_model\n",
+        "        self.num_heads = num_heads\n",
+        "        self.head_dim = d_model // num_heads\n",
+        "        self.qkv_layer = nn.Linear(d_model, 3 * d_model)\n",
+        "        self.linear_layer = nn.Linear(d_model, d_model)\n",
+        "\n",
+        "    def forward(self, x, mask=None):\n",
+        "        batch_size, seq_length, _ = x.size()\n",
+        "        qkv = self.qkv_layer(x)\n",
+        "        qkv = qkv.reshape(batch_size, seq_length, self.num_heads, 3 * self.head_dim)\n",
+        "        qkv = qkv.permute(0, 2, 1, 3)\n",
+        "        q, k, v = qkv.chunk(3, dim=-1)\n",
+        "        values, attention = scaled_dot_product(q, k, v, mask)\n",
+        "        values = values.reshape(batch_size, seq_length, self.num_heads * self.head_dim)\n",
+        "        out = self.linear_layer(values)\n",
+        "        return out\n"
+      ],
+      "metadata": {
+        "id": "H79Wa35_k43D"
+      },
+      "execution_count": 6,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Projects input into queries, keys, and values.\n",
+        "\n",
+        "Splits them into multiple heads for parallel attention learning.\n",
+        "\n",
+        "Each head focuses on a different subspace of representation.\n",
+        "\n",
+        "Concatenates and linearly transforms them back to d_model dimension."
+      ],
+      "metadata": {
+        "id": "Y7An46g8k4gj"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class MultiHeadCrossAttention(nn.Module):\n",
+        "    def __init__(self, d_model, num_heads):\n",
+        "        super().__init__()\n",
+        "        self.d_model = d_model\n",
+        "        self.num_heads = num_heads\n",
+        "        self.head_dim = d_model // num_heads\n",
+        "        self.kv_layer = nn.Linear(d_model, 2 * d_model)\n",
+        "        self.q_layer = nn.Linear(d_model, d_model)\n",
+        "        self.linear_layer = nn.Linear(d_model, d_model)\n",
+        "\n",
+        "    def forward(self, x, y, mask=None):\n",
+        "        batch_size, seq_length, _ = x.size()\n",
+        "        kv = self.kv_layer(x)\n",
+        "        q = self.q_layer(y)\n",
+        "        kv = kv.reshape(batch_size, seq_length, self.num_heads, 2 * self.head_dim)\n",
+        "        q = q.reshape(batch_size, seq_length, self.num_heads, self.head_dim)\n",
+        "        kv = kv.permute(0, 2, 1, 3)\n",
+        "        q = q.permute(0, 2, 1, 3)\n",
+        "        k, v = kv.chunk(2, dim=-1)\n",
+        "        values, attention = scaled_dot_product(q, k, v, mask)\n",
+        "        values = values.reshape(batch_size, seq_length, self.d_model)\n",
+        "        out = self.linear_layer(values)\n",
+        "        return out\n"
+      ],
+      "metadata": {
+        "id": "Cx6wAD0yk3Ts"
+      },
+      "execution_count": 7,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Used in Decoderâ€“Encoder connections.\n",
+        "\n",
+        "K and V come from the encoder output (x),\n",
+        "while Q comes from the decoder (y).\n",
+        "\n",
+        "Helps the decoder attend to relevant encoder features."
+      ],
+      "metadata": {
+        "id": "O_0lO5oPlFl8"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class DecoderLayer(nn.Module):\n",
+        "    def __init__(self, d_model, ffn_hidden, num_heads, drop_prob):\n",
+        "        super().__init__()\n",
+        "        self.self_attention = MultiHeadAttention(d_model, num_heads)\n",
+        "        self.norm1 = LayerNormalization([d_model])\n",
+        "        self.dropout1 = nn.Dropout(p=drop_prob)\n",
+        "        self.encoder_decoder_attention = MultiHeadCrossAttention(d_model, num_heads)\n",
+        "        self.norm2 = LayerNormalization([d_model])\n",
+        "        self.dropout2 = nn.Dropout(p=drop_prob)\n",
+        "        self.ffn = PositionwiseFeedForward(d_model, ffn_hidden, drop_prob)\n",
+        "        self.norm3 = LayerNormalization([d_model])\n",
+        "        self.dropout3 = nn.Dropout(p=drop_prob)\n",
+        "\n",
+        "    def forward(self, x, y, decoder_mask):\n",
+        "        _y = y\n",
+        "        y = self.self_attention(y, mask=decoder_mask)\n",
+        "        y = self.dropout1(y)\n",
+        "        y = self.norm1(y + _y)\n",
+        "\n",
+        "        _y = y\n",
+        "        y = self.encoder_decoder_attention(x, y)\n",
+        "        y = self.dropout2(y)\n",
+        "        y = self.norm2(y + _y)\n",
+        "\n",
+        "        _y = y\n",
+        "        y = self.ffn(y)\n",
+        "        y = self.dropout3(y)\n",
+        "        y = self.norm3(y + _y)\n",
+        "        return y\n"
+      ],
+      "metadata": {
+        "id": "MRneLFQglHzr"
+      },
+      "execution_count": 8,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "**Flow:**\n",
+        "\n",
+        "**Masked Self-Attention:**\n",
+        "The decoder looks at previous tokens (future ones masked).\n",
+        "\n",
+        "**Cross-Attention:**\n",
+        "Connects to the encoderâ€™s output for context.\n",
+        "\n",
+        "**Feedforward Network:**\n",
+        "Adds nonlinearity and deeper representation power.\n",
+        "\n",
+        "**Residual + LayerNorm:**\n",
+        "After each step, residual connections and normalization stabilize gradients."
+      ],
+      "metadata": {
+        "id": "uvoxnlX3lJ6z"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class SequentialDecoder(nn.Sequential):\n",
+        "    def forward(self, *inputs):\n",
+        "        x, y, mask = inputs\n",
+        "        for module in self._modules.values():\n",
+        "            y = module(x, y, mask)\n",
+        "        return y\n"
+      ],
+      "metadata": {
+        "id": "drfakza6lCwD"
+      },
+      "execution_count": 9,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "**Stacks multiple DecoderLayers.**\n",
+        "\n",
+        "Feeds the output of one layer into the next in sequence."
+      ],
+      "metadata": {
+        "id": "m8glIzprlTFc"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class Decoder(nn.Module):\n",
+        "    def __init__(self, d_model, ffn_hidden, num_heads, drop_prob, num_layers=1):\n",
+        "        super().__init__()\n",
+        "        self.layers = SequentialDecoder(*[\n",
+        "            DecoderLayer(d_model, ffn_hidden, num_heads, drop_prob)\n",
+        "            for _ in range(num_layers)\n",
+        "        ])\n",
+        "\n",
+        "    def forward(self, x, y, mask):\n",
+        "        y = self.layers(x, y, mask)\n",
+        "        return y"
+      ],
+      "metadata": {
+        "id": "0UZe0xsXlWnD"
+      },
+      "execution_count": 10,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Combines multiple layers into a full decoder stack.\n",
+        "\n",
+        "Each layer repeats self-attention â†’ cross-attention â†’ feedforward.\n",
+        "\n",
+        "num_layers defines decoder depth (here, 5 layers)."
+      ],
+      "metadata": {
+        "id": "o20PSUsNlX2L"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "d_model = 512\n",
+        "num_heads = 8\n",
+        "drop_prob = 0.1\n",
+        "batch_size = 30\n",
+        "max_sequence_length = 200\n",
+        "ffn_hidden = 2048\n",
+        "num_layers = 5\n",
+        "\n",
+        "x = torch.randn((batch_size, max_sequence_length, d_model))\n",
+        "y = torch.randn((batch_size, max_sequence_length, d_model))\n",
+        "mask = torch.full([max_sequence_length, max_sequence_length], float('-inf'))\n",
+        "mask = torch.triu(mask, diagonal=1)\n",
+        "decoder = Decoder(d_model, ffn_hidden, num_heads, drop_prob, num_layers)\n",
+        "out = decoder(x, y, mask)"
+      ],
+      "metadata": {
+        "id": "HdfbJcvelav8"
+      },
+      "execution_count": 11,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "print(out)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "o_HU0EjwloHU",
+        "outputId": "f25b71c5-88f7-41cc-e35f-c62ac22388bb"
+      },
+      "execution_count": 12,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "tensor([[[ 0.8483, -1.5130, -1.0294,  ..., -1.7971, -0.6627, -0.2493],\n",
+            "         [-0.1286,  0.4190,  0.5515,  ..., -1.0953,  1.8280,  0.2260],\n",
+            "         [-1.0160, -0.7728,  0.8552,  ..., -0.3770,  0.7206, -1.7009],\n",
+            "         ...,\n",
+            "         [-1.4675, -1.3779,  0.4696,  ..., -0.7159, -0.5289,  0.3690],\n",
+            "         [-0.3545,  0.9258,  1.3856,  ...,  0.1064, -0.7601, -1.3119],\n",
+            "         [ 0.5759, -0.3608, -0.6522,  ...,  0.1425, -0.3651,  0.8350]],\n",
+            "\n",
+            "        [[-0.8018, -1.6261, -1.2081,  ...,  0.1909,  0.0668,  1.0435],\n",
+            "         [-2.7187,  0.7994,  0.7035,  ..., -0.6052,  0.3100, -0.4639],\n",
+            "         [-0.3874,  2.0777,  1.1576,  ..., -0.2313, -1.9917,  1.4528],\n",
+            "         ...,\n",
+            "         [ 0.0914,  0.1942,  0.9081,  ..., -0.7985, -0.6961, -1.2718],\n",
+            "         [ 0.8409, -0.4229,  1.5350,  ...,  0.2965, -1.4381, -0.6059],\n",
+            "         [-1.8653,  0.6308, -0.3067,  ..., -0.0729, -0.1651,  0.2196]],\n",
+            "\n",
+            "        [[-0.0908, -0.2383,  0.1555,  ...,  0.5616,  0.1010,  0.6915],\n",
+            "         [-0.2132, -1.6608, -1.1445,  ..., -0.6336,  0.4270, -0.9832],\n",
+            "         [-0.1127,  1.0155,  0.6073,  ..., -0.1714, -0.1050,  0.2317],\n",
+            "         ...,\n",
+            "         [-0.0881,  0.0091,  1.8040,  ..., -0.3638,  0.1164,  1.0501],\n",
+            "         [ 0.4530,  0.3484, -1.3165,  ...,  0.0488, -0.4969, -1.5548],\n",
+            "         [ 0.3717,  0.1993, -0.5476,  ...,  0.1846, -0.7108,  1.5643]],\n",
+            "\n",
+            "        ...,\n",
+            "\n",
+            "        [[ 0.2608, -0.6519,  0.6667,  ...,  0.0753, -0.6564,  0.3058],\n",
+            "         [ 0.8198, -0.0246, -0.6636,  ..., -1.3893, -0.3124,  1.1258],\n",
+            "         [-1.3685,  0.8566,  0.9757,  ..., -0.6601, -0.4189, -0.1412],\n",
+            "         ...,\n",
+            "         [-0.8058, -0.4531,  0.6114,  ...,  0.9256, -2.2956, -1.1472],\n",
+            "         [ 1.5920, -0.1390, -0.1323,  ...,  0.3896, -0.3162, -0.7781],\n",
+            "         [-0.4178,  0.0949,  0.7093,  ..., -1.2966,  0.8887,  0.4949]],\n",
+            "\n",
+            "        [[ 0.6404, -1.6707, -0.3488,  ...,  0.4782,  1.0014, -1.2488],\n",
+            "         [ 0.9062, -1.1340, -0.1050,  ..., -0.7903, -0.4157, -1.1410],\n",
+            "         [ 0.5683,  1.2196,  1.3519,  ..., -0.0687, -0.1452,  1.4318],\n",
+            "         ...,\n",
+            "         [ 0.5921, -0.5280, -0.1094,  ..., -0.1817, -1.4081, -1.1779],\n",
+            "         [-0.1219,  0.4039, -0.5824,  ..., -0.1116,  0.6317, -1.1309],\n",
+            "         [-0.2255, -0.5092, -0.7150,  ...,  1.8919,  1.8734, -0.2381]],\n",
+            "\n",
+            "        [[-1.2193,  0.2291, -1.7858,  ..., -0.2026, -1.0508, -0.4118],\n",
+            "         [ 0.1600, -0.6898,  2.0283,  ..., -0.6296,  0.9202,  0.9615],\n",
+            "         [ 1.1990, -0.2096, -0.8472,  ..., -2.0150, -0.3118, -0.3059],\n",
+            "         ...,\n",
+            "         [-0.3509,  0.4322, -0.5473,  ..., -1.7692,  0.4191, -0.7605],\n",
+            "         [-0.8132,  0.3595,  0.1959,  ...,  0.6084, -0.9672, -0.0043],\n",
+            "         [ 1.4483, -0.0431,  0.2734,  ..., -0.0304, -0.9883, -1.1020]]],\n",
+            "       grad_fn=<AddBackward0>)\n"
+          ]
+        }
+      ]
+    }
+  ]
+}
+===== EncoderBlock.ipynb =====
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "source": [
+        "import torch\n",
+        "import torch.nn as nn"
+      ],
+      "metadata": {
+        "id": "g0x9xMJQ2xm5"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def scaled_dot_product(q,k,v, mask=None):\n",
+        "  #each 30 X 8 X 200 X 64\n",
+        "  d_k = q.size()[-1] #64\n",
+        "  scaled = torch.matmul(q,k.transpose(-1,-2))/torch.sqrt(d_k)\n",
+        "  if mask is not None:\n",
+        "    scaled += mask #won't be used because we are in encoder so we have all the dictionary\n",
+        "  attention = torch.softmax(scaled, dim=-1) #30 X 8 X 200 X 200\n",
+        "  output = torch.matmul(attention,v) # for every batch 30 X 8 X 200 X 64\n",
+        "  return output, attention"
+      ],
+      "metadata": {
+        "id": "1dBw-VM748vo"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class MultiHeadAttention(nn.Module):\n",
+        "  def __init__(self, d_model, num_heads):\n",
+        "    super(MultiHeadAttention, self).__init__()\n",
+        "    self.d_model = d_model #512\n",
+        "    self.num_heads = num_heads #8\n",
+        "    self.head_dim = d_model // num_heads #64\n",
+        "    self.qkv_layer = nn.Linear(d_model, 3*d_model) #in parallel (512 x 1536)\n",
+        "    self.linear_layer = nn.Linear(d_model, d_model) #512 x 512\n",
+        "\n",
+        "    def forward(self, x, mask=None):\n",
+        "      batch_size, max_sequence_length, d_model = x.size() #30 x 200 x 512\n",
+        "      print(f\"x.size(): {x.size()}\")\n",
+        "      qkv = self.qkv_layer(x) #30 x 200 x 1536\n",
+        "      print(f\"qkv.size(): {qkv.size()}\")\n",
+        "      qkv = qkv.reshape(batch_size, max_sequence_length, self.num_heads, 3 * self.head_dim) #30 x 200 x 8 x 192\n",
+        "      print(f\"qkv.size(): {qkv.size()}\")\n",
+        "      qkv = qkv.permute(0, 2, 1, 3) # 30 x 8 x 200 x 192\n",
+        "      print(f\"qkv.size(): {qkv.size()}\")\n",
+        "      q, k, v = qkv.chunk(3, dim=-1) #each 30 X 8 X 200 X 64\n",
+        "      print(f\"q size: {q.size()}, k size: {k.size()}, v size: {v.size()}, \")\n",
+        "      values, attention = scaled_dot_product(q, k, v, mask) ## attention = 30 X 8 X 200 X 200 ## value = 30 X 8 X 200 X 64\n",
+        "      print(f\"values.size(): {values.size()}, attention.size:{ attention.size()} \")\n",
+        "      values = values.reshape(batch_size, max_sequence_length, self.num_heads * self.head_dim) #30 x 200 x 512\n",
+        "      print(f\"values.size(): {values.size()}\")\n",
+        "      out = self.linear_layer(values)\n",
+        "      print(f\"out.size(): {out.size()}\")\n",
+        "      return out"
+      ],
+      "metadata": {
+        "id": "EhTIjnR69uDf"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class LayerNormalization(nn.Module):\n",
+        "    def __init__(self, parameters_shape, eps=1e-5):\n",
+        "        super().__init__()\n",
+        "        self.parameters_shape=parameters_shape\n",
+        "        self.eps=eps\n",
+        "        self.gamma = nn.Parameter(torch.ones(parameters_shape))\n",
+        "        self.beta =  nn.Parameter(torch.zeros(parameters_shape))\n",
+        "\n",
+        "    def forward(self, inputs):\n",
+        "        dims = [-(i + 1) for i in range(len(self.parameters_shape))]\n",
+        "        mean = inputs.mean(dim=dims, keepdim=True)\n",
+        "        print(f\"Mean ({mean.size()})\")\n",
+        "        var = ((inputs - mean) ** 2).mean(dim=dims, keepdim=True)\n",
+        "        std = (var + self.eps).sqrt()\n",
+        "        print(f\"Standard Deviation  ({std.size()})\")\n",
+        "        y = (inputs - mean) / std\n",
+        "        print(f\"y: {y.size()}\")\n",
+        "        out = self.gamma * y  + self.beta\n",
+        "        print(f\"self.gamma: {self.gamma.size()}, self.beta: {self.beta.size()}\")\n",
+        "        print(f\"out: {out.size()}\")\n",
+        "        return out\n"
+      ],
+      "metadata": {
+        "id": "5I7LdaejA2X_"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class PositionwiseFeedForward(nn.Module):\n",
+        "\n",
+        "    def __init__(self, d_model, hidden, drop_prob=0.1):\n",
+        "        super(PositionwiseFeedForward, self).__init__()\n",
+        "        self.linear1 = nn.Linear(d_model, hidden) #512 x 2048\n",
+        "        self.linear2 = nn.Linear(hidden, d_model) #2048 x 512\n",
+        "        self.relu = nn.ReLU()\n",
+        "        self.dropout = nn.Dropout(p=drop_prob)\n",
+        "\n",
+        "    def forward(self, x): #30 x 200 x 512\n",
+        "        x = self.linear1(x) #30 x 200 x 2048\n",
+        "        print(f\"x after first linear layer: {x.size()}\")\n",
+        "        x = self.relu(x) #30 x 200 x 2048\n",
+        "        print(f\"x after activation: {x.size()}\")\n",
+        "        x = self.dropout(x) #30 x 200 x 2048\n",
+        "        print(f\"x after dropout: {x.size()}\")\n",
+        "        x = self.linear2(x) #30 x 200 x 512\n",
+        "        print(f\"x after 2nd linear layer: {x.size()}\")\n",
+        "        return x"
+      ],
+      "metadata": {
+        "id": "EOFMl0cABD1v"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class EncoderLayer(nn.Module):\n",
+        "  def __init__(self, d_model, num_heads, drop_prob, ffn_hidden):\n",
+        "    super(EncoderLayer, self).__init__()\n",
+        "    self.attention = MultiHeadAttention(d_model, num_heads)\n",
+        "    self.norm1 =  LayerNormalization(parameters_shape = [d_model])\n",
+        "    self.dropout1 = nn.Dropout(p = drop_prob)\n",
+        "    self.ffn = PositionwiseFeedForward(d_model, ffn_hidden, drop_prob)\n",
+        "    self.norm2 = LayerNormalization(parameters_shape = [d_model])\n",
+        "    self.dropout2 = nn.Dropout(p = drop_prob)\n",
+        "\n",
+        "  def forward(self,x):\n",
+        "    residual_x = x #30 x 200 x 512\n",
+        "    x = self.attention(x,x,x) #30 x 200 x 512\n",
+        "    x = self.dropout1(x) #30 x 200 x 512\n",
+        "    x = self.norm1(x + residual_x)\n",
+        "    residual_x = x\n",
+        "    x = self.ffn(x) #30 x 200 x 512\n",
+        "    x = self.dropout2(x) #30 x 200 x 512\n",
+        "    x = self.norm2(x + residual_x) #30 x 200 x 512\n",
+        "    return x #more context aware than before(UPDATED)"
+      ],
+      "metadata": {
+        "id": "4St99nIZ4KnR"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class Encoder(nn.Module):\n",
+        "  def __init__(self, d_model, num_heads, drop_prob, ffn_hidden, num_layers):\n",
+        "    super(Encoder, self).__init__()\n",
+        "    self.layers = nn.ModuleList([EncoderLayer(d_model, num_heads, drop_prob, ffn_hidden) for _ in range(num_layers)])\n",
+        "\n",
+        "  def forwad(self,x):\n",
+        "    x = self.forwad(x)\n",
+        "    return x"
+      ],
+      "metadata": {
+        "id": "FFFOLpdd2q7P"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "UH89jeuo05kc"
+      },
+      "outputs": [],
+      "source": [
+        "d_model = 512\n",
+        "num_heads = 8\n",
+        "drop_prob = 0.1\n",
+        "batch_size = 30\n",
+        "max_sequence_length = 200\n",
+        "ffn_hidden = 2048\n",
+        "num_layers = 5\n",
+        "\n",
+        "encoder = Encoder(d_model, num_heads, drop_prob, ffn_hidden, num_layers)"
+      ]
+    }
+  ]
+}
+===== layerNormalization.ipynb =====
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "0pXhvEGSbhbu"
+      },
+      "outputs": [],
+      "source": [
+        "import torch\n",
+        "import torch.nn as nn"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "inputs = torch.Tensor([[[0.2, 0.1, 0.3], [0.5, 0.1, 0.1]]])\n",
+        "B, S, E = inputs.size()\n",
+        "inputs = inputs.reshape(S,B,E)\n",
+        "inputs.size()"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "gOftA-4NceeX",
+        "outputId": "6b5e73ef-18c8-4aff-c0c8-e912b6adc738"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([2, 1, 3])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 2
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "parameter_shape = inputs.size()[-2:]\n",
+        "parameter_shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "6j1LCGDodAJp",
+        "outputId": "8ce87763-5683-4254-a26e-948989fe271d"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 3])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 7
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "gamma =  nn.Parameter(torch.ones(parameter_shape))\n",
+        "beta = nn.Parameter(torch.zeros(parameter_shape))"
+      ],
+      "metadata": {
+        "id": "AhzgtpyKdWaz"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "dims = [-(i+1) for i in range (len(parameter_shape))]\n",
+        "dims"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "k_CgKxzSdYEz",
+        "outputId": "4d389989-3a59-4e5b-a68a-4178cd9f473d"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "[-1, -2]"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 10
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mean = inputs.mean(dim=dims, keepdim=True)\n",
+        "mean.size()"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "x464ywv2doRE",
+        "outputId": "9155de53-9f44-4289-88cf-063be17a3768"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([2, 1, 1])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 11
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mean"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "HYHUzA0ldqKD",
+        "outputId": "81ba9e5b-2b57-45d7-c1eb-eee014efba11"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[[0.2000]],\n",
+              "\n",
+              "        [[0.2333]]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 12
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "var = ((inputs - mean) ** 2 ).mean(dim=dims, keepdim=True)\n",
+        "epsilon = 1e-5\n",
+        "std = (var+epsilon).sqrt()\n",
+        "std"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "Q_OYIMl2ge3q",
+        "outputId": "cc7ad697-2b6b-4f39-9d5c-6d90791ab3a3"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[[0.0817]],\n",
+              "\n",
+              "        [[0.1886]]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 13
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "y = (inputs - mean) / std"
+      ],
+      "metadata": {
+        "id": "va2vZRZsgrYb"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "y"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "MhFW7qdxgxPr",
+        "outputId": "ad501314-8817-42bd-df22-f09a56d4113c"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[[ 0.0000, -1.2238,  1.2238]],\n",
+              "\n",
+              "        [[ 1.4140, -0.7070, -0.7070]]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 15
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "out = gamma * y + beta\n",
+        "out"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "oeWCak2pgyuL",
+        "outputId": "37ea2f22-a48e-4af8-bfa4-7d4499d2f274"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[[ 0.0000, -1.2238,  1.2238]],\n",
+              "\n",
+              "        [[ 1.4140, -0.7070, -0.7070]]], grad_fn=<AddBackward0>)"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 16
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "90fe2d93"
+      },
+      "source": [
+        "### Custom Layer Normalization Implementation\n",
+        "\n",
+        "This cell defines a custom `LayerNormalization` module using PyTorch's `nn.Module`. Layer Normalization is a technique used to normalize the inputs of a layer across the features, which can help stabilize and accelerate training of deep neural networks, particularly in models like transformers.\n",
+        "\n",
+        "The implementation includes:\n",
+        "- Learnable `gamma` and `beta` parameters for scaling and shifting the normalized output.\n",
+        "- Calculation of the mean and variance across the specified dimensions.\n",
+        "- Normalization of the input using the calculated mean and standard deviation.\n",
+        "- An affine transformation using the `gamma` and `beta` parameters.\n",
+        "- Debugging print statements to show intermediate values and shapes."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "\n",
+        "class LayerNormalization(nn.Module):\n",
+        "    def __init__(self, parameters_shape, eps=1e-5):\n",
+        "        super().__init__()\n",
+        "        self.parameters_shape = parameters_shape\n",
+        "        self.eps = eps\n",
+        "        self.gamma = nn.Parameter(torch.ones(parameters_shape))\n",
+        "        self.beta = nn.Parameter(torch.zeros(parameters_shape))\n",
+        "\n",
+        "    def forward(self, inputs):\n",
+        "        dims = dims = [-(i+1) for i in range (len(parameter_shape))]\n",
+        "        mean = inputs.mean(dim=dims, keepdim=True)\n",
+        "        print(f\"Mean \\n ({mean.size()}): \\n {mean}\")\n",
+        "        var = ((inputs - mean) ** 2 ).mean(dim=dims, keepdim=True)\n",
+        "        std = (var+epsilon).sqrt()\n",
+        "        print(f\"Standard Deviation \\n ({std.size()}): \\n {std}\")\n",
+        "        y = (inputs - mean) / std\n",
+        "        print(f\"y \\n ({y.size()}) = \\n {y}\")\n",
+        "        out = self.gamma * y + self.beta\n",
+        "        print(f\"out \\n ({out.size()}) = \\n {out}\")\n",
+        "        return out"
+      ],
+      "metadata": {
+        "id": "EZqQyBa0g53a"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "batch_size = 3 #for Q,K,V\n",
+        "sentence_length = 5 #INPUT\n",
+        "embedding_dim = 8 #For 8 MultiHead Attention\n",
+        "inputs = torch.randn(sentence_length, batch_size, embedding_dim)\n",
+        "\n",
+        "print(f\"input \\n ({inputs.size()}) = \\n {inputs}\")"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "4iHvM_yLh9QU",
+        "outputId": "e9549d98-c4e1-4ece-a0a9-779b903d83d1"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "input \n",
+            " (torch.Size([5, 3, 8])) = \n",
+            " tensor([[[-1.2450e+00,  1.1626e+00,  5.4151e-01, -1.1042e+00,  3.5732e-01,\n",
+            "          -6.9579e-01, -1.1969e+00,  5.9790e-01],\n",
+            "         [ 1.0233e+00, -9.6010e-01, -1.4094e+00,  3.9346e-01,  1.7239e+00,\n",
+            "          -5.3952e-01,  7.7403e-01, -5.7328e-01],\n",
+            "         [-1.2331e-01, -1.0926e+00, -9.8302e-01, -1.4572e+00, -7.0129e-01,\n",
+            "           1.0467e+00, -5.0996e-01,  9.1159e-01]],\n",
+            "\n",
+            "        [[ 1.0450e+00, -3.5307e-02,  9.4701e-02, -2.8675e-01,  3.0977e-01,\n",
+            "           1.0187e+00, -2.1272e-02,  5.0088e-01],\n",
+            "         [-8.4592e-01, -1.0629e+00, -5.5482e-01, -5.4918e-01, -1.0241e-01,\n",
+            "          -1.6936e+00,  2.2802e-01,  1.4542e-01],\n",
+            "         [-7.6899e-01, -2.1538e-01, -8.6672e-02,  6.3904e-01,  1.4018e+00,\n",
+            "           4.3134e-01, -1.6876e-02,  7.9366e-01]],\n",
+            "\n",
+            "        [[ 4.8937e-01,  2.0301e-01,  6.9634e-01,  1.2340e-01, -4.6241e-01,\n",
+            "           4.6583e-01,  3.9648e-01, -7.8475e-01],\n",
+            "         [ 1.0100e+00, -2.1067e-01,  3.9061e-01, -1.2532e+00,  1.6536e+00,\n",
+            "           3.1920e-01, -1.1403e-01, -4.4163e-01],\n",
+            "         [ 1.5216e-01,  2.0256e+00,  8.6204e-01, -1.1924e-01,  3.2898e-01,\n",
+            "          -1.0057e+00,  8.3793e-01,  8.3984e-01]],\n",
+            "\n",
+            "        [[ 5.8814e-02,  2.4280e-01,  2.4422e-02, -1.1965e+00,  2.7839e+00,\n",
+            "          -1.2085e+00,  6.3627e-01,  1.3497e-01],\n",
+            "         [ 1.9749e+00, -2.9849e-02, -2.4329e-01, -2.6060e-02, -2.8489e-01,\n",
+            "           1.7873e-01,  2.0526e-01, -1.8200e+00],\n",
+            "         [-1.2323e+00, -1.6332e+00,  5.6881e-01, -3.0575e+00,  7.1613e-01,\n",
+            "          -7.0703e-01,  2.3519e-01, -5.4371e-01]],\n",
+            "\n",
+            "        [[-3.9843e-01, -6.7085e-01,  5.3762e-04, -1.6112e+00, -7.2835e-01,\n",
+            "           3.4205e-01, -1.3325e+00,  6.3665e-01],\n",
+            "         [-1.4485e+00,  1.6466e+00,  4.2602e-01,  5.6253e-01, -1.8804e+00,\n",
+            "           1.4792e+00, -5.6382e-01, -5.3846e-01],\n",
+            "         [-1.2252e+00, -5.7476e-01,  2.0691e-01,  3.2774e-02,  2.3765e+00,\n",
+            "          -1.1009e+00, -1.7622e+00, -3.7399e-01]]])\n"
+          ]
+        }
+      ]
+    }
+  ]
+}
+===== multiHeadAttention (1).ipynb =====
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "78167af1"
+      },
+      "source": [
+        "**Imports**: Importing necessary PyTorch libraries for building neural networks and tensor operations."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "f82e552d"
+      },
+      "source": [
+        "import numpy as np\n",
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "import torch.nn.functional as F"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "2b4fb869"
+      },
+      "source": [
+        "**Input Tensor**: Creating a random input tensor `x` representing a batch of sequences.\n",
+        "- `batch_size`: Number of sequences in the batch (here, 1).\n",
+        "- `sequence_length`: Length of each sequence (here, 4).\n",
+        "- `input_dim`: Dimensionality of the input features (here, 512).\n",
+        "- The size of `x` is (batch_size, sequence_length, input_dim)."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "843f2c51"
+      },
+      "source": [
+        "sequence_length = 4 #my name is Wahb\n",
+        "batch_size = 1\n",
+        "input_dim = 512\n",
+        "d_model = 512\n",
+        "x = torch.randn((batch_size, sequence_length, input_dim))"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "48783098"
+      },
+      "source": [
+        "**Input Tensor Size**: Displaying the size of the input tensor `x`.\n",
+        "- Size: (1, 4, 512)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "dce84727",
+        "outputId": "a37e93bd-6b24-4784-bbe4-dace252170b7"
+      },
+      "source": [
+        "x.size()"
+      ],
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 4, 512])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 66
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "c62c00ee"
+      },
+      "source": [
+        "**Linear Layer for QKV**: Creating a linear layer to project the input features into Query (Q), Key (K), and Value (V) vectors.\n",
+        "- `input_dim`: Input feature dimension (512).\n",
+        "- `3 * d_model`: Output dimension, which is 3 times the model dimension (`d_model`) to accommodate Q, K, and V for multi-head attention. Here, it's 3 * 512 = 1536."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "a5329c91"
+      },
+      "source": [
+        "qkv_linear = nn.Linear(input_dim, 3*d_model)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "e8dc89a5"
+      },
+      "source": [
+        "**Applying Linear Layer**: Applying the linear layer `qkv_linear` to the input tensor `x`.\n",
+        "- The linear layer transforms the last dimension of `x` from `input_dim` (512) to `3 * d_model` (1536)."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "300aacb8"
+      },
+      "source": [
+        "qkv = qkv_linear(x)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "b7c948f6"
+      },
+      "source": [
+        "**QKV Tensor Size**: Displaying the size of the resulting tensor `qkv`.\n",
+        "- Size: (batch_size, sequence_length, 3 * d_model). Here, it's (1, 4, 1536). This tensor contains the concatenated Q, K, and V for all attention heads."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "83171bc2",
+        "outputId": "0ad07607-0636-4d78-98a5-a7899199f8cd"
+      },
+      "source": [
+        "qkv.shape"
+      ],
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 4, 1536])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 69
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import matplotlib.pyplot as plt\n",
+        "y_val = torch.histc(qkv, bins=200, min=-3, max=3)\n",
+        "x_val = np.arange(-1, 1, 0.01) * 3\n",
+        "plt.bar(x_val, y_val, align='center', color=['forestgreen'])\n",
+        "plt.title('qkv distribution')"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 469
+        },
+        "id": "r1xbXUXuGB8D",
+        "outputId": "1b2b9b0b-afd7-4ba2-9c05-a6c90dfc0a7e"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "Text(0.5, 1.0, 'qkv distribution')"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 70
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": [
+              "<Figure size 640x480 with 1 Axes>"
+            ],
+            "image/png": "iVBORw0KGgoAAAANSUhEUgAAAigAAAGzCAYAAAAFROyYAAAAOnRFWHRTb2Z0d2FyZQBNYXRwbG90bGliIHZlcnNpb24zLjEwLjAsIGh0dHBzOi8vbWF0cGxvdGxpYi5vcmcvlHJYcgAAAAlwSFlzAAAPYQAAD2EBqD+naQAAKs5JREFUeJzt3XtUlXW+x/HPRmRLKhsxBSlQhlxe0xxvoTZpcsLLMVlpScuMHEenAjumleLJW0dj8njSJBPrnKW10lGnk3rGU14GTU4TkmJO5V3HC8kATg57K42o8Jw/Wu5mC16wjc8PeL/WetZq/57L/vKY8lm/5/f7PQ7LsiwBAAAYJMDuAgAAAK5GQAEAAMYhoAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjENAAWo5h8Oh1NTU2/69J06ckMPh0IoVK7xts2fPlsPhuC3f379/f/Xv39/7+dNPP5XD4dCHH354W77/6aefVps2bW7LdwH1EQEFgK0KCgo0e/Zs7d271+5SKjG5NqCuI6AA8JtXXnlFf//736t1TkFBgebMmVPtELBlyxZt2bKlWudU1/Vqe/fdd3Xo0KEa/X6gPgu0uwAAdUdgYKACA2v2n5Xvv/9ed9xxh4KCgmr0e26kYcOGtn4/UNfRgwIY6rPPPlPPnj3VqFEjxcbGatmyZTc9xmPu3LkKCAhQRkaGioqKFBgYqDlz5lQ67tChQ3I4HHrrrbeue72SkhI9/fTTcrlcCg0NVXJyskpKSiodV1V9W7duVb9+/RQaGqomTZqoXbt2mj59uqQfxo307NlTkjR27Fg5HA6fcS39+/dX586dlZeXp1/84he64447vOdePQblivLyck2fPl0RERFq3LixHnnkEeXn5/sc06ZNGz399NOVzv3Ha96otqrGoJSWlmrKlCmKioqS0+lUu3bttGDBAl390vgr44bWr1+vzp07y+l0qlOnTtq0aVOlmoD6ih4UwEBff/21Hn74YbVo0UKzZ8/W5cuXNWvWLIWHh9/w3FdeeUWvvfaali1bpvHjx0uSHnzwQa1du1azZs3yOXbNmjVq0KCBHnvssWtez7IsDR8+XJ999pmeeeYZdejQQevWrVNycvINa9m3b5/++Z//WV26dNGrr74qp9Opo0eP6o9//KMkqUOHDnr11Vc1c+ZMTZgwQQ888IAkqU+fPt5rfPfddxo8eLCSkpL05JNP3vAezJs3Tw6HQ1OnTlVxcbEWLVqk+Ph47d27V8HBwTes+Yqbqe0fWZalRx55RNu3b9e4ceN03333afPmzXrppZd0+vRpLVy40Of4zz77TB999JGee+45NW3aVIsXL9aIESN06tQpNW/e/KbrBOosC4BxEhMTrUaNGlknT570tu3fv99q0KCBdfVfW0lWSkqKZVmWNWXKFCsgIMBasWKFzzHLli2zJFlff/21T3vHjh2thx566Lq1rF+/3pJkzZ8/39t2+fJl64EHHrAkWcuXL/e2z5o1y6e+hQsXWpKsM2fOXPP6u3btqnSdKx588EFLkpWZmVnlvgcffND7efv27ZYk66677rI8Ho+3fe3atZYk68033/S2tW7d2kpOTr7hNa9XW3JystW6dWvv5yv3ae7cuT7HjRw50nI4HNbRo0e9bZKsoKAgn7Y//elPliQrIyOj0ncB9RGPeADDlJeXa/PmzUpMTFR0dLS3vUOHDkpISKjyHMuylJqaqjfffFMffPBBpd6NRx99VIGBgVqzZo237ZtvvtH+/fs1atSo69bz8ccfKzAwUM8++6y3rUGDBpo4ceINf5bQ0FBJ0oYNG1RRUXHD46vidDo1duzYmz7+qaeeUtOmTb2fR44cqVatWunjjz++pe+/WR9//LEaNGig559/3qd9ypQpsixLn3zyiU97fHy8YmNjvZ+7dOmikJAQ/fnPf67ROoHagoACGObMmTP6+9//rrZt21ba165duyrPef/997VkyRJlZGToiSeeqLT/zjvv1MCBA7V27Vpv25o1axQYGKhHH330uvWcPHlSrVq1UpMmTW6qln80atQo9e3bV7/61a8UHh6upKQkrV27tlph5a677qrWgNir75vD4dA999yjEydO3PQ1bsXJkycVGRnpE46kH4Lllf3/6B/D5xXNmjXT3/72t5orEqhFCChAHdC3b1+Fh4frrbfe0tmzZ6s8JikpSYcPH/ZOmV27dq0GDhyoO++8s8bqCg4OVnZ2tv7whz9ozJgx+uqrrzRq1Cj90z/9k8rLy2/6Gv52rYHGN1uTPzRo0KDKduuqAbVAfUVAAQzTokULBQcH68iRI5X2XWvdjXvuuUdbtmxRQUGBBg0apHPnzlU6JjExUUFBQVqzZo327t2rw4cPKykp6Yb1tG7dWn/5y190/vz5m6rlagEBARo4cKDeeOMN7d+/X/PmzdO2bdu0fft2SdcOC7fq6vtmWZaOHj3qM+OmWbNmVc5CurqXozq1tW7dWgUFBZXu/cGDB737Adw8AgpgmAYNGighIUHr16/XqVOnvO0HDhzQ5s2br3lely5d9PHHH+vAgQMaNmxYpQXTQkNDlZCQoLVr12r16tUKCgpSYmLiDesZMmSILl++rKVLl3rbysvLlZGRccNzq+rNue+++yRJZWVlkqTGjRtLUpWB4Va8//77PiHhww8/1F/+8hcNHjzY2xYbG6udO3fq4sWL3raNGzdWmo5cndqGDBmi8vLySlO2Fy5cKIfD4fP9AG6MacaAgebMmaNNmzbpgQce0HPPPafLly8rIyNDnTp10ldffXXN8+6//35t2LBBQ4YM0ciRI7V+/XqfBcVGjRqlJ598Um+//bYSEhK8g1ivZ9iwYerbt6+mTZumEydOqGPHjvroo4/kdrtveO6rr76q7OxsDR06VK1bt1ZxcbHefvtt3X333erXr5+kH8JCaGioMjMz1bRpUzVu3Fi9e/dWTEzMjW9UFcLCwtSvXz+NHTtWRUVFWrRoke655x7vlGtJ+tWvfqUPP/xQgwYN0uOPP65jx47pgw8+8Bm0Wt3ahg0bpgEDBuhf//VfdeLECXXt2lVbtmzRhg0bNGnSpErXBnAD9k4iAnAtO3bssLp3724FBQVZP/vZz6zMzMxK03gty3ea8RUbNmywAgMDrVGjRlnl5eXedo/HYwUHB1uSrA8++OCma/nuu++sMWPGWCEhIZbL5bLGjBljffnllzecZpyVlWUNHz7cioyMtIKCgqzIyEjriSeesA4fPlyp3o4dO1qBgYE+13zwwQetTp06VVnTtaYZ//a3v7XS0tKsli1bWsHBwdbQoUN9pmtf8R//8R/WXXfdZTmdTqtv377W7t27K13zerVdPc3Ysizr3Llz1gsvvGBFRkZaDRs2tNq2bWv9+7//u1VRUeFzXFV/ZpZ17enPQH3ksCxGZAG1xezZszVnzhwGUgKo8xiDAgAAjENAAQAAxiGgAAAA4zAGBQAAGIceFAAAYBwCCgAAME6tXKitoqJCBQUFatq0qd+XyQYAADXDsiydO3dOkZGRCgi4fh9JrQwoBQUFioqKsrsMAABwC/Lz83X33Xdf95haGVCuvM48Pz9fISEhNlcDAABuhsfjUVRUlPf3+PXUyoBy5bFOSEgIAQUAgFrmZoZnVHuQbHZ2toYNG6bIyEg5HA6tX7/+msc+88wzcjgcWrRokU/72bNnNXr0aIWEhCg0NFTjxo2r9Cp3AABQf1U7oJSWlqpr165asmTJdY9bt26ddu7cqcjIyEr7Ro8erX379mnr1q3auHGjsrOzNWHChOqWAgAA6qhqP+IZPHiwBg8efN1jTp8+rYkTJ2rz5s0aOnSoz74DBw5o06ZN2rVrl3r06CFJysjI0JAhQ7RgwYIqAw0AAKhf/L4OSkVFhcaMGaOXXnpJnTp1qrQ/JydHoaGh3nAiSfHx8QoICFBubm6V1ywrK5PH4/HZAABA3eX3gPL6668rMDBQzz//fJX7CwsL1bJlS5+2wMBAhYWFqbCwsMpz0tPT5XK5vBtTjAEAqNv8GlDy8vL05ptvasWKFX5dQC0tLU1ut9u75efn++3aAADAPH4NKP/3f/+n4uJiRUdHKzAwUIGBgTp58qSmTJmiNm3aSJIiIiJUXFzsc97ly5d19uxZRUREVHldp9PpnVLM1GIAAOo+v66DMmbMGMXHx/u0JSQkaMyYMRo7dqwkKS4uTiUlJcrLy1P37t0lSdu2bVNFRYV69+7tz3IAAEAtVe2Acv78eR09etT7+fjx49q7d6/CwsIUHR2t5s2b+xzfsGFDRUREqF27dpKkDh06aNCgQRo/frwyMzN16dIlpaamKikpiRk8AABA0i084tm9e7e6deumbt26SZImT56sbt26aebMmTd9jZUrV6p9+/YaOHCghgwZon79+umdd96pbikAAKCOcliWZdldRHV5PB65XC653W7GowAAUEtU5/e336cZAwAA/FQEFAAAYBwCCgAAMI5fpxkDqBtiF8TaXUKNOPbiMbtLAHCT6EEBAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHdVAAeNXV9U8A1D70oAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjMM6KADqjZ+6zsuxF4/5qRIAN0IPCgAAMA49KEA9xIqxAExHDwoAADAOAQUAABiHgAIAAIxDQAEAAMYhoAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjENAAQAAxuFlgUAdxksBAdRW9KAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOs3iAOojZOwBqu2r3oGRnZ2vYsGGKjIyUw+HQ+vXrvfsuXbqkqVOn6t5771Xjxo0VGRmpp556SgUFBT7XOHv2rEaPHq2QkBCFhoZq3LhxOn/+/E/+YQAAQN1Q7YBSWlqqrl27asmSJZX2ff/999qzZ49mzJihPXv26KOPPtKhQ4f0yCOP+Bw3evRo7du3T1u3btXGjRuVnZ2tCRMm3PpPAQAA6hSHZVnWLZ/scGjdunVKTEy85jG7du1Sr169dPLkSUVHR+vAgQPq2LGjdu3apR49ekiSNm3apCFDhujbb79VZGTkDb/X4/HI5XLJ7XYrJCTkVssH6iwe8dSMYy8es7sEoFarzu/vGh8k63a75XA4FBoaKknKyclRaGioN5xIUnx8vAICApSbm1vlNcrKyuTxeHw2AABQd9VoQLlw4YKmTp2qJ554wpuUCgsL1bJlS5/jAgMDFRYWpsLCwiqvk56eLpfL5d2ioqJqsmwAAGCzGgsoly5d0uOPPy7LsrR06dKfdK20tDS53W7vlp+f76cqAQCAiWpkmvGVcHLy5Elt27bN5zlTRESEiouLfY6/fPmyzp49q4iIiCqv53Q65XQ6a6JUAABgIL/3oFwJJ0eOHNEf/vAHNW/e3Gd/XFycSkpKlJeX523btm2bKioq1Lt3b3+XAwAAaqFq96CcP39eR48e9X4+fvy49u7dq7CwMLVq1UojR47Unj17tHHjRpWXl3vHlYSFhSkoKEgdOnTQoEGDNH78eGVmZurSpUtKTU1VUlLSTc3gAQAAdV+1pxl/+umnGjBgQKX25ORkzZ49WzExMVWet337dvXv31/SDwu1paam6ve//70CAgI0YsQILV68WE2aNLmpGphmDFwf04xrBtOMgZ+mOr+/q92D0r9/f10v09xM3gkLC9OqVauq+9UAAKCe4GWBAADAOAQUAABgHAIKAAAwDgEFAAAYh4ACAACMQ0ABAADGqZGl7gHULNY5scet3nfWTwGqjx4UAABgHAIKAAAwDgEFAAAYh4ACAACMQ0ABAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHgAIAAIxDQAEAAMYhoAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjENAAQAAxiGgAAAA4xBQAACAcQgoAADAOAQUAABgnEC7CwCAui52QazP52MvHrOpEqD2oAcFAAAYh4ACAACMQ0ABAADGIaAAAADjMEgWqEWuHmwJAHUVPSgAAMA4BBQAAGAcAgoAADBOtQNKdna2hg0bpsjISDkcDq1fv95nv2VZmjlzplq1aqXg4GDFx8fryJEjPsecPXtWo0ePVkhIiEJDQzVu3DidP3/+J/0gAACg7qh2QCktLVXXrl21ZMmSKvfPnz9fixcvVmZmpnJzc9W4cWMlJCTowoUL3mNGjx6tffv2aevWrdq4caOys7M1YcKEW/8pAABAneKwLMu65ZMdDq1bt06JiYmSfug9iYyM1JQpU/Tiiy9Kktxut8LDw7VixQolJSXpwIED6tixo3bt2qUePXpIkjZt2qQhQ4bo22+/VWRkZKXvKSsrU1lZmfezx+NRVFSU3G63QkJCbrV8oNZhFk/dwFL3qK88Ho9cLtdN/f726xiU48ePq7CwUPHx8d42l8ul3r17KycnR5KUk5Oj0NBQbziRpPj4eAUEBCg3N7fK66anp8vlcnm3qKgof5YNAAAM49eAUlhYKEkKDw/3aQ8PD/fuKywsVMuWLX32BwYGKiwszHvM1dLS0uR2u71bfn6+P8sGAACGqRULtTmdTjmdTrvLAAAAt4lfe1AiIiIkSUVFRT7tRUVF3n0REREqLi722X/58mWdPXvWewwA1GWxC2IZTwTcgF8DSkxMjCIiIpSVleVt83g8ys3NVVxcnCQpLi5OJSUlysvL8x6zbds2VVRUqHfv3v4sBwAA1FLVfsRz/vx5HT161Pv5+PHj2rt3r8LCwhQdHa1JkyZp7ty5atu2rWJiYjRjxgxFRkZ6Z/p06NBBgwYN0vjx45WZmalLly4pNTVVSUlJVc7gAQAA9U+1A8ru3bs1YMAA7+fJkydLkpKTk7VixQq9/PLLKi0t1YQJE1RSUqJ+/fpp06ZNatSokfeclStXKjU1VQMHDlRAQIBGjBihxYsX++HHAQAAdcFPWgfFLtWZRw3UJYxbqFtYDwX1jW3roAAAAPgDAQUAABiHgAIAAIxDQAEAAMYhoAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjENAAQAAxiGgAAAA4wTaXQCAG+MtxgDqG3pQAACAcQgoAADAOAQUAABgHAIKAAAwDgEFAAAYh4ACAACMQ0ABAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHgAIAAIxDQAEAAMYhoAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAME6g3QUAkGIXxNpdAmxw9Z/7sReP2VQJYB56UAAAgHHoQQEAQ1yrJ42eFdRH9KAAAADjEFAAAIBxCCgAAMA4fg8o5eXlmjFjhmJiYhQcHKzY2Fj927/9myzL8h5jWZZmzpypVq1aKTg4WPHx8Tpy5Ii/SwEAALWU3wPK66+/rqVLl+qtt97SgQMH9Prrr2v+/PnKyMjwHjN//nwtXrxYmZmZys3NVePGjZWQkKALFy74uxwAAFAL+X0Wz+eff67hw4dr6NChkqQ2bdrot7/9rb744gtJP/SeLFq0SK+88oqGDx8uSXr//fcVHh6u9evXKykpyd8lAQCAWsbvPSh9+vRRVlaWDh8+LEn605/+pM8++0yDBw+WJB0/flyFhYWKj4/3nuNyudS7d2/l5ORUec2ysjJ5PB6fDQAA1F1+70GZNm2aPB6P2rdvrwYNGqi8vFzz5s3T6NGjJUmFhYWSpPDwcJ/zwsPDvfuulp6erjlz5vi7VAAAYCi/96CsXbtWK1eu1KpVq7Rnzx699957WrBggd57771bvmZaWprcbrd3y8/P92PFAADANH7vQXnppZc0bdo071iSe++9VydPnlR6erqSk5MVEREhSSoqKlKrVq285xUVFem+++6r8ppOp1NOp9PfpQIAAEP5vQfl+++/V0CA72UbNGigiooKSVJMTIwiIiKUlZXl3e/xeJSbm6u4uDh/lwMAAGohv/egDBs2TPPmzVN0dLQ6deqkL7/8Um+88YZ++ctfSpIcDocmTZqkuXPnqm3btoqJidGMGTMUGRmpxMREf5cDAABqIb8HlIyMDM2YMUPPPfeciouLFRkZqV//+teaOXOm95iXX35ZpaWlmjBhgkpKStSvXz9t2rRJjRo18nc5AACgFnJY/7jEay3h8XjkcrnkdrsVEhJidznAT3att9gCEm8zRt1Rnd/fvIsHAAAYh4ACAACMQ0ABAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHgAIAAIxDQAEAAMbx+8sCAQD+daN3NfGuHtRF9KAAAADjEFAAAIBxeMQD2OBGXfYAUN/RgwIAAIxDQAEAAMYhoAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjENAAQAAxiGgAAAA4xBQAACAcQgoAADAOAQUAABgHAIKAAAwDgEFAAAYh4ACAACMQ0ABAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHgAIAAIxDQAEAAMapkYBy+vRpPfnkk2revLmCg4N17733avfu3d79lmVp5syZatWqlYKDgxUfH68jR47URCkAAKAWCvT3Bf/2t7+pb9++GjBggD755BO1aNFCR44cUbNmzbzHzJ8/X4sXL9Z7772nmJgYzZgxQwkJCdq/f78aNWrk75IAoE6LXRDr8/nYi8dsqgTwH78HlNdff11RUVFavny5ty0mJsb735ZladGiRXrllVc0fPhwSdL777+v8PBwrV+/XklJSf4uCQAA1DJ+f8TzP//zP+rRo4cee+wxtWzZUt26ddO7777r3X/8+HEVFhYqPj7e2+ZyudS7d2/l5ORUec2ysjJ5PB6fDQAA1F1+70H585//rKVLl2ry5MmaPn26du3apeeff15BQUFKTk5WYWGhJCk8PNznvPDwcO++q6Wnp2vOnDn+LhW4La7ufgcA3Jjfe1AqKir085//XK+99pq6deumCRMmaPz48crMzLzla6alpcntdnu3/Px8P1YMAABM4/eA0qpVK3Xs2NGnrUOHDjp16pQkKSIiQpJUVFTkc0xRUZF339WcTqdCQkJ8NgAAUHf5PaD07dtXhw4d8mk7fPiwWrduLemHAbMRERHKysry7vd4PMrNzVVcXJy/ywEAALWQ38egvPDCC+rTp49ee+01Pf744/riiy/0zjvv6J133pEkORwOTZo0SXPnzlXbtm2904wjIyOVmJjo73IAAEAt5PeA0rNnT61bt05paWl69dVXFRMTo0WLFmn06NHeY15++WWVlpZqwoQJKikpUb9+/bRp0ybWQAEAAJIkh2VZlt1FVJfH45HL5ZLb7WY8CozHLB7cbizUBlNV5/c37+IBAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHgAIAAIxDQAEAAMYhoAAAAOMQUAAAgHEIKAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjBNodwFAXRW7INbuEgCg1qIHBQAAGIeAAgAAjENAAQAAxiGgAAAA4xBQAACAcQgoAADAOAQUAABgHAIKAAAwDgEFAAAYh4ACAACMQ0ABgDomdkEsr1pArUdAAQAAxiGgAEAdRU8KajMCCgAAMA4BBQAAGIeAAgAAjENAAQAAxiGgAAAA4xBQAACAcQgoAADAOIF2FwDUVqwvAQA1hx4UAABgHAIKAAAwDgEFAAAYp8YDym9+8xs5HA5NmjTJ23bhwgWlpKSoefPmatKkiUaMGKGioqKaLgUAANQSNRpQdu3apWXLlqlLly4+7S+88IJ+//vf63e/+5127NihgoICPfroozVZCgAAqEVqLKCcP39eo0eP1rvvvqtmzZp5291ut/7rv/5Lb7zxhh566CF1795dy5cv1+eff66dO3fWVDkAAKAWqbGAkpKSoqFDhyo+Pt6nPS8vT5cuXfJpb9++vaKjo5WTk1PltcrKyuTxeHw2AABQd9XIOiirV6/Wnj17tGvXrkr7CgsLFRQUpNDQUJ/28PBwFRYWVnm99PR0zZkzpyZKBYA67+o1e469eMymSoCb5/celPz8fP3Lv/yLVq5cqUaNGvnlmmlpaXK73d4tPz/fL9cFAABm8ntAycvLU3FxsX7+858rMDBQgYGB2rFjhxYvXqzAwECFh4fr4sWLKikp8TmvqKhIERERVV7T6XQqJCTEZwMA3JrYBbGshAzj+f0Rz8CBA/X111/7tI0dO1bt27fX1KlTFRUVpYYNGyorK0sjRoyQJB06dEinTp1SXFycv8sBAAC1kN8DStOmTdW5c2eftsaNG6t58+be9nHjxmny5MkKCwtTSEiIJk6cqLi4ON1///3+LgcAANRCtrwscOHChQoICNCIESNUVlamhIQEvf3223aUAgAADOSwLMuyu4jq8ng8crlccrvdjEeBbXiGj9qO2Ty43arz+5t38QAAAOMQUAAAgHEIKAAAwDi2DJIFANjvWuOoGJsCE9CDAgAAjENAAQAAxiGgAAAA4xBQAACAcQgoAADAOAQUAABgHAIKAAAwDgEFAAAYh4ACAACMQ0ABAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADBOoN0FAKaLXRBrdwkAUO/QgwIAAIxDQAEAAMYhoAAAAOMQUAAAgHEYJIt6j0GwAGAeelAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHgAIAAIxDQAEAAMYhoAAAAOMQUAAAgHFYSRYA4ONaqysfe/HYba4E9Rk9KAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjENAAQAAxvF7QElPT1fPnj3VtGlTtWzZUomJiTp06JDPMRcuXFBKSoqaN2+uJk2aaMSIESoqKvJ3KQAAoJby+zooO3bsUEpKinr27KnLly9r+vTpevjhh7V//341btxYkvTCCy/of//3f/W73/1OLpdLqampevTRR/XHP/7R3+UAXtda2wEAYB6HZVlWTX7BmTNn1LJlS+3YsUO/+MUv5Ha71aJFC61atUojR46UJB08eFAdOnRQTk6O7r///hte0+PxyOVyye12KyQkpCbLRx1CQAF+GhZqw09Vnd/fNT4Gxe12S5LCwsIkSXl5ebp06ZLi4+O9x7Rv317R0dHKycmp8hplZWXyeDw+GwAAqLtqNKBUVFRo0qRJ6tu3rzp37ixJKiwsVFBQkEJDQ32ODQ8PV2FhYZXXSU9Pl8vl8m5RUVE1WTYAALBZjQaUlJQUffPNN1q9evVPuk5aWprcbrd3y8/P91OFAADARDX2ssDU1FRt3LhR2dnZuvvuu73tERERunjxokpKSnx6UYqKihQREVHltZxOp5xOZ02VCgAADOP3HhTLspSamqp169Zp27ZtiomJ8dnfvXt3NWzYUFlZWd62Q4cO6dSpU4qLi/N3OQAAoBbyew9KSkqKVq1apQ0bNqhp06becSUul0vBwcFyuVwaN26cJk+erLCwMIWEhGjixImKi4u7qRk8AACg7vN7QFm6dKkkqX///j7ty5cv19NPPy1JWrhwoQICAjRixAiVlZUpISFBb7/9tr9LAQAAtZTfA8rNLKvSqFEjLVmyREuWLPH31wMAgDqAd/EAAADjEFAAAIBxCCgAAMA4NbYOCmAK3sEDALUPPSgAAMA49KAAAG7KtXojecsxagI9KAAAwDgEFAAAYBwe8QAAfpKbHYjOoyBUBz0oAADAOAQUAABgHAIKAAAwDgEFAAAYh4ACAACMQ0ABAADGIaAAAADjsA4K6ixeEggAtRc9KAAAwDgEFAAAYBwCCgAAMA4BBQAAGIdBsqgzGBQLAHUHPSgAAMA4BBQAAGAcHvGg1uKRDgDUXfSgAAAA49CDAmPRQwLULVf+Th978ZjNlaA2oAcFAAAYh4ACAACMwyMeGINHOkD9UN2/6zwSqp/oQQEAAMYhoAAAAOMQUAAAgHEIKAAAwDgMkoVtGBQLALgWelAAAIBxCCgAAMA4POJBjeNRDoCfgnVT6id6UAAAgHEIKAAAwDi2BpQlS5aoTZs2atSokXr37q0vvvjCznIAAIAhbAsoa9as0eTJkzVr1izt2bNHXbt2VUJCgoqLi+0qCQAAGMJhWZZlxxf37t1bPXv21FtvvSVJqqioUFRUlCZOnKhp06Zd91yPxyOXyyW3262QkJDbUW69wGBWALh5DMatvur8/rZlFs/FixeVl5entLQ0b1tAQIDi4+OVk5NT6fiysjKVlZV5P7vdbkk//KDwn4oLFXaXAAC1Br+Dqu/KPbuZvhFbAspf//pXlZeXKzw83Kc9PDxcBw8erHR8enq65syZU6k9KiqqxmoEAOB6XDNcdpdQa507d04u1/XvX61YByUtLU2TJ0/2fq6oqNDZs2fVvHlzORwOGyu7dR6PR1FRUcrPz6/3j6m4Fz/gPvyIe/Ej7sUPuA8/qs33wrIsnTt3TpGRkTc81paAcuedd6pBgwYqKiryaS8qKlJERESl451Op5xOp09baGhoTZZ424SEhNS6/8FqCvfiB9yHH3EvfsS9+AH34Ue19V7cqOfkCltm8QQFBal79+7KysrytlVUVCgrK0txcXF2lAQAAAxi2yOeyZMnKzk5WT169FCvXr20aNEilZaWauzYsXaVBAAADGFbQBk1apTOnDmjmTNnqrCwUPfdd582bdpUaeBsXeV0OjVr1qxKj67qI+7FD7gPP+Je/Ih78QPuw4/qy72wbR0UAACAa+FdPAAAwDgEFAAAYBwCCgAAMA4BBQAAGIeAAgAAjENAMcQjjzyi6OhoNWrUSK1atdKYMWNUUFBgd1m31YkTJzRu3DjFxMQoODhYsbGxmjVrli5evGh3abaYN2+e+vTpozvuuKPOrJx8s5YsWaI2bdqoUaNG6t27t7744gu7S7rtsrOzNWzYMEVGRsrhcGj9+vV2l2SL9PR09ezZU02bNlXLli2VmJioQ4cO2V2WLZYuXaouXbp4V5CNi4vTJ598YndZNYaAYogBAwZo7dq1OnTokP77v/9bx44d08iRI+0u67Y6ePCgKioqtGzZMu3bt08LFy5UZmampk+fbndptrh48aIee+wxPfvss3aXclutWbNGkydP1qxZs7Rnzx517dpVCQkJKi4utru026q0tFRdu3bVkiVL7C7FVjt27FBKSop27typrVu36tKlS3r44YdVWlpqd2m33d13363f/OY3ysvL0+7du/XQQw9p+PDh2rdvn92l1QwLRtqwYYPlcDisixcv2l2KrebPn2/FxMTYXYatli9fbrlcLrvLuG169eplpaSkeD+Xl5dbkZGRVnp6uo1V2UuStW7dOrvLMEJxcbElydqxY4fdpRihWbNm1n/+53/aXUaNoAfFQGfPntXKlSvVp08fNWzY0O5ybOV2uxUWFmZ3GbhNLl68qLy8PMXHx3vbAgICFB8fr5ycHBsrgyncbrck1ft/F8rLy7V69WqVlpbW2XfYEVAMMnXqVDVu3FjNmzfXqVOntGHDBrtLstXRo0eVkZGhX//613aXgtvkr3/9q8rLyyu98iI8PFyFhYU2VQVTVFRUaNKkSerbt686d+5sdzm2+Prrr9WkSRM5nU4988wzWrdunTp27Gh3WTWCgFKDpk2bJofDcd3t4MGD3uNfeuklffnll9qyZYsaNGigp556SlYdeBNBde+DJJ0+fVqDBg3SY489pvHjx9tUuf/dyr0A8IOUlBR98803Wr16td2l2KZdu3bau3evcnNz9eyzzyo5OVn79++3u6wawbt4atCZM2f03XffXfeYn/3sZwoKCqrU/u233yoqKkqff/55re++q+59KCgoUP/+/XX//fdrxYoVCgioOzn6Vv6fWLFihSZNmqSSkpIars5+Fy9e1B133KEPP/xQiYmJ3vbk5GSVlJTU215Fh8OhdevW+dyT+iY1NVUbNmxQdna2YmJi7C7HGPHx8YqNjdWyZcvsLsXvbHubcX3QokULtWjR4pbOraiokCSVlZX5syRbVOc+nD59WgMGDFD37t21fPnyOhVOpJ/2/0R9EBQUpO7duysrK8v7y7iiokJZWVlKTU21tzjYwrIsTZw4UevWrdOnn35KOLlKRUVFnfg9URUCigFyc3O1a9cu9evXT82aNdOxY8c0Y8YMxcbG1vrek+o4ffq0+vfvr9atW2vBggU6c+aMd19ERISNldnj1KlTOnv2rE6dOqXy8nLt3btXknTPPfeoSZMm9hZXgyZPnqzk5GT16NFDvXr10qJFi1RaWqqxY8faXdptdf78eR09etT7+fjx49q7d6/CwsIUHR1tY2W3V0pKilatWqUNGzaoadOm3rFILpdLwcHBNld3e6WlpWnw4MGKjo7WuXPntGrVKn366afavHmz3aXVDHsnEcGyLOurr76yBgwYYIWFhVlOp9Nq06aN9cwzz1jffvut3aXdVsuXL7ckVbnVR8nJyVXei+3bt9tdWo3LyMiwoqOjraCgIKtXr17Wzp077S7pttu+fXuVf/7Jycl2l3ZbXevfhOXLl9td2m33y1/+0mrdurUVFBRktWjRwho4cKC1ZcsWu8uqMYxBAQAAxqlbD/gBAECdQEABAADGIaAAAADjEFAAAIBxCCgAAMA4BBQAAGAcAgoAADAOAQUAABiHgAIAAIxDQAEAAMYhoAAAAOP8PwuW9FoiRpduAAAAAElFTkSuQmCC\n"
+          },
+          "metadata": {}
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "num_heads = 8\n",
+        "head_dim = d_model // num_heads\n",
+        "print(head_dim)\n",
+        "qkv = qkv.reshape(batch_size, sequence_length, num_heads, 3 * head_dim)\n",
+        "qkv = qkv.permute(0, 2, 1, 3)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "brEgbD3YGKG7",
+        "outputId": "93076045-4586-4c7d-d4dc-7a62e9739ae0"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "64\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "qkv.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "pTb47iVbGgnK",
+        "outputId": "c8710cad-004d-4399-b867-a21e2d565122"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 8, 4, 192])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 72
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "9e169556"
+      },
+      "source": [
+        "**Q, K, V Tensor Shapes**: The `q`, `k`, and `v` tensors each have a shape of `(1, 8, 4, 64)`.\n",
+        "- **1**: Batch size.\n",
+        "- **8**: Number of attention heads.\n",
+        "- **4**: Sequence length.\n",
+        "- **64**: Head dimension (`d_model / num_heads`)."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "q, k, v = qkv.chunk(3, dim=-1)\n",
+        "q.shape, k.shape, v.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "8U9OcLWTGsTy",
+        "outputId": "3ac982ca-b7d0-4be4-fa7f-f9390e31ef56"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "(torch.Size([1, 8, 4, 64]),\n",
+              " torch.Size([1, 8, 4, 64]),\n",
+              " torch.Size([1, 8, 4, 64]))"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 73
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "d_k = q.shape[-1]\n",
+        "scaled = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(d_k)\n",
+        "scaled.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "8sDKIYqJNpfB",
+        "outputId": "f4a0ad6d-b9b1-4ec9-84cc-965993d046f6"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 8, 4, 4])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 74
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "k.T.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "B4o3Fp1jN1nC",
+        "outputId": "03dac3f4-b26c-4f0d-f33d-3462d3370e24"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([64, 4, 8, 1])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 75
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "k.transpose(-1, -2).shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "TA9rLqGeQKn2",
+        "outputId": "68105180-5096-4524-9ada-33ced0b29969"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 8, 64, 4])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 76
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mask = torch.full(scaled.size(), float('-inf'))\n",
+        "mask = torch.triu(mask, diagonal=1)\n",
+        "mask[0][1]"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "HQ7cJqeLQUgH",
+        "outputId": "0eb53f9a-011d-48e2-f601-46da12ffd042"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[0., -inf, -inf, -inf],\n",
+              "        [0., 0., -inf, -inf],\n",
+              "        [0., 0., 0., -inf],\n",
+              "        [0., 0., 0., 0.]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 77
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "(scaled + mask)[0][0]"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "DbWFcFXzRa8-",
+        "outputId": "5ac05641-bf8b-4fa4-d0c8-214ecd0145ae"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[ 0.1114,    -inf,    -inf,    -inf],\n",
+              "        [ 0.2192,  0.1304,    -inf,    -inf],\n",
+              "        [ 0.3629, -0.0562,  0.1760,    -inf],\n",
+              "        [-0.2850, -0.0551, -0.0084, -0.0667]], grad_fn=<SelectBackward0>)"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 78
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "scaled += mask"
+      ],
+      "metadata": {
+        "id": "XzALbqKCRnsH"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "attention = f.softmax(scaled, dim=-1)\n",
+        "attention.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "x6KMYABlRrR3",
+        "outputId": "86ffc253-10c8-4fbe-ce70-d14d56c01b41"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 8, 4, 4])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 80
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "attention[0][0]"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "77zW2ld6R2K9",
+        "outputId": "bcaf17e8-9b38-4955-e350-30ae197fc431"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[1.0000, 0.0000, 0.0000, 0.0000],\n",
+              "        [0.5222, 0.4778, 0.0000, 0.0000],\n",
+              "        [0.4021, 0.2644, 0.3335, 0.0000],\n",
+              "        [0.2074, 0.2610, 0.2735, 0.2580]], grad_fn=<SelectBackward0>)"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 81
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "values = torch.matmul(attention, v)\n",
+        "values.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "--wNqTSmTKuF",
+        "outputId": "4d48a943-7406-45a5-8ade-1ee6c491f1f6"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 8, 4, 64])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 82
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import math\n",
+        "\n",
+        "def scaled_dot_product_attention(query, key, value, mask = None):\n",
+        "    d_k = query.size()[-1]\n",
+        "    scaled = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(d_k)\n",
+        "    if mask is not None:\n",
+        "      scaled += mask\n",
+        "    attention = f.softmax(scaled, dim=-1)\n",
+        "    values = torch.matmul(attention, value)\n",
+        "    return values, attention"
+      ],
+      "metadata": {
+        "id": "_asoMS16Tpfl"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "values, attention = scaled_dot_product_attention(q, k, v, mask=mask)"
+      ],
+      "metadata": {
+        "id": "QfPC5kpdUiEV"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "attention.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "CySxUguPUlIo",
+        "outputId": "1849b25d-2d9d-45b0-ed92-69d262742ef3"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 8, 4, 4])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 85
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "attention[0][0]"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "u48KdvgfUnFB",
+        "outputId": "98879976-21f1-4569-bcdb-c9bd289b86a1"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[1.0000, 0.0000, 0.0000, 0.0000],\n",
+              "        [0.5222, 0.4778, 0.0000, 0.0000],\n",
+              "        [0.4021, 0.2644, 0.3335, 0.0000],\n",
+              "        [0.2074, 0.2610, 0.2735, 0.2580]], grad_fn=<SelectBackward0>)"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 86
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "values.size()\n",
+        "values = values.reshape(batch_size, sequence_length, num_heads * head_dim)\n",
+        "values.size()"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "Oj3uqhdLUvGV",
+        "outputId": "7517731d-b8e5-416a-e04d-3aeb29b1a144"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 4, 512])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 87
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "linear_layer = nn.Linear(d_model, d_model)"
+      ],
+      "metadata": {
+        "id": "kSm57iPbU03M"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "out = linear_layer(values)\n"
+      ],
+      "metadata": {
+        "id": "yBDDgfi9U2Il"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "out.shape\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "BcngzEcZU4Ud",
+        "outputId": "c221c70b-a84c-4343-fa2d-6e4ec1a2f17e"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([1, 4, 512])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 90
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "out"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "M1Sawgy2U8QF",
+        "outputId": "fb9a704c-b6d6-4557-afbd-f019e377beb2"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[[-0.1222, -0.8289,  0.1227,  ..., -0.3490, -0.0365, -0.4245],\n",
+              "         [-0.0278,  0.5209,  0.1794,  ...,  0.0643, -0.2195, -0.1305],\n",
+              "         [ 0.1214,  0.0093,  0.1386,  ..., -0.1972,  0.0367, -0.1496],\n",
+              "         [-0.1395, -0.1085,  0.3016,  ...,  0.0923,  0.4975, -0.1096]]],\n",
+              "       grad_fn=<ViewBackward0>)"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 91
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "import math\n",
+        "\n",
+        "def scaled_dot_product(q, k, v, mask=None):\n",
+        "    d_k = q.size()[-1]\n",
+        "    scaled = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(d_k)\n",
+        "    if mask is not None:\n",
+        "        scaled += mask\n",
+        "    attention = F.softmax(scaled, dim=-1)\n",
+        "    values = torch.matmul(attention, v)\n",
+        "    return values, attention\n",
+        "\n",
+        "class MultiheadAttention(nn.Module):\n",
+        "\n",
+        "    def __init__(self, input_dim, d_model, num_heads):\n",
+        "        super().__init__()\n",
+        "        self.input_dim = input_dim\n",
+        "        self.d_model = d_model\n",
+        "        self.num_heads = num_heads\n",
+        "        self.head_dim = d_model // num_heads\n",
+        "        self.qkv_layer = nn.Linear(input_dim , 3 * d_model)\n",
+        "        self.linear_layer = nn.Linear(d_model, d_model)\n",
+        "\n",
+        "    def forward(self, x, mask=None):\n",
+        "        batch_size, sequence_length, input_dim = x.size()\n",
+        "        print(f\"x.size(): {x.size()}\")\n",
+        "        qkv = self.qkv_layer(x)\n",
+        "        print(f\"qkv.size(): {qkv.size()}\")\n",
+        "        qkv = qkv.reshape(batch_size, sequence_length, self.num_heads, 3 * self.head_dim)\n",
+        "        print(f\"qkv.size(): {qkv.size()}\")\n",
+        "        qkv = qkv.permute(0, 2, 1, 3)\n",
+        "        print(f\"qkv.size(): {qkv.size()}\")\n",
+        "        q, k, v = qkv.chunk(3, dim=-1)\n",
+        "        print(f\"q size: {q.size()}, k size: {k.size()}, v size: {v.size()}, \")\n",
+        "        values, attention = scaled_dot_product(q, k, v, mask)\n",
+        "        print(f\"values.size(): {values.size()}, attention.size:{ attention.size()} \")\n",
+        "        values = values.reshape(batch_size, sequence_length, self.num_heads * self.head_dim)\n",
+        "        print(f\"values.size(): {values.size()}\")\n",
+        "        out = self.linear_layer(values)\n",
+        "        print(f\"out.size(): {out.size()}\")\n",
+        "        return out\n"
+      ],
+      "metadata": {
+        "id": "m7OThfxwU_qc"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "input_dim = 1024\n",
+        "d_model = 512\n",
+        "num_heads = 8\n",
+        "\n",
+        "batch_size = 30\n",
+        "sequence_length = 5\n",
+        "x = torch.randn( (batch_size, sequence_length, input_dim) )\n",
+        "\n",
+        "model = MultiheadAttention(input_dim, d_model, num_heads)\n",
+        "out = model.forward(x)\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "jz7zz_uPVBts",
+        "outputId": "24bd7f1b-ec1d-4a32-ed74-430251548cd1"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "x.size(): torch.Size([30, 5, 1024])\n",
+            "qkv.size(): torch.Size([30, 5, 1536])\n",
+            "qkv.size(): torch.Size([30, 5, 8, 192])\n",
+            "qkv.size(): torch.Size([30, 8, 5, 192])\n",
+            "q size: torch.Size([30, 8, 5, 64]), k size: torch.Size([30, 8, 5, 64]), v size: torch.Size([30, 8, 5, 64]), \n",
+            "values.size(): torch.Size([30, 8, 5, 64]), attention.size:torch.Size([30, 8, 5, 5]) \n",
+            "values.size(): torch.Size([30, 5, 512])\n",
+            "out.size(): torch.Size([30, 5, 512])\n"
+          ]
+        }
+      ]
+    }
+  ]
+}
+===== PositionalEncoding (1).ipynb =====
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "ZG1XSBi8-0Qo"
+      },
+      "outputs": [],
+      "source": [
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "\n",
+        "max_sequence_length = 10\n",
+        "d_model = 6"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "even_i = torch.arange(0, d_model, 2).float()\n",
+        "even_i"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "4ZP1Lx1E-8id",
+        "outputId": "e98ecaf9-627f-42ae-fc0b-14b47a516dcf"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([0., 2., 4.])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 2
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "odd_i = torch.arange(1, d_model, 2).float()\n",
+        "odd_i"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "DVaNQr5E_T3j",
+        "outputId": "23215376-6d0e-4932-dc49-e55a464270cc"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([1., 3., 5.])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 3
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "even_denominator = torch.pow(10000, (odd_i-1) / d_model)\n",
+        "even_denominator"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "BA1IrAJM_ZcW",
+        "outputId": "21cbc75b-fa37-417a-9a4b-16f9d1d628e4"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([  1.0000,  21.5443, 464.1590])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 6
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "denominator = even_denominator\n",
+        "denominator"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "8ixsYp08_07C",
+        "outputId": "a077271f-4b18-4d50-dc01-c116eccc397c"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([  1.0000,  21.5443, 464.1590])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 7
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "position = torch.arange(max_sequence_length, dtype=torch.float).reshape(max_sequence_length, 1)\n",
+        "position"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "xEI5ICMg_3w2",
+        "outputId": "f84fc674-a1b5-4c57-c23b-ad39a1b28c14"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[0.],\n",
+              "        [1.],\n",
+              "        [2.],\n",
+              "        [3.],\n",
+              "        [4.],\n",
+              "        [5.],\n",
+              "        [6.],\n",
+              "        [7.],\n",
+              "        [8.],\n",
+              "        [9.]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 8
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "even_PE = torch.sin(position / denominator)\n",
+        "odd_PE = torch.cos(position / denominator)"
+      ],
+      "metadata": {
+        "id": "0fYzvqN-ALBx"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "even_PE"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "gL3_bQUzAPci",
+        "outputId": "898312e4-ab62-4ee1-80d3-4244ea1258f2"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[ 0.0000,  0.0000,  0.0000],\n",
+              "        [ 0.8415,  0.0464,  0.0022],\n",
+              "        [ 0.9093,  0.0927,  0.0043],\n",
+              "        [ 0.1411,  0.1388,  0.0065],\n",
+              "        [-0.7568,  0.1846,  0.0086],\n",
+              "        [-0.9589,  0.2300,  0.0108],\n",
+              "        [-0.2794,  0.2749,  0.0129],\n",
+              "        [ 0.6570,  0.3192,  0.0151],\n",
+              "        [ 0.9894,  0.3629,  0.0172],\n",
+              "        [ 0.4121,  0.4057,  0.0194]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 10
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "odd_PE"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "iDjwMhRIAdXi",
+        "outputId": "9c35b3cd-07c0-49d7-afa4-70bacbe51c80"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[ 1.0000,  1.0000,  1.0000],\n",
+              "        [ 0.5403,  0.9989,  1.0000],\n",
+              "        [-0.4161,  0.9957,  1.0000],\n",
+              "        [-0.9900,  0.9903,  1.0000],\n",
+              "        [-0.6536,  0.9828,  1.0000],\n",
+              "        [ 0.2837,  0.9732,  0.9999],\n",
+              "        [ 0.9602,  0.9615,  0.9999],\n",
+              "        [ 0.7539,  0.9477,  0.9999],\n",
+              "        [-0.1455,  0.9318,  0.9999],\n",
+              "        [-0.9111,  0.9140,  0.9998]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 15
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "odd_PE.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "gX13C-n_AUdJ",
+        "outputId": "616f7320-cd2f-456a-f9a6-a52ae809530e"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([10, 3])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 12
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "stacked = torch.stack([even_PE, odd_PE], dim=2)\n",
+        "stacked.shape"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "ovmiSaS2AZUS",
+        "outputId": "70202250-3255-4eda-cc0b-45f558c4efa9"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "torch.Size([10, 3, 2])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 13
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "PE = torch.flatten(stacked, start_dim=1, end_dim=2)\n",
+        "PE"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "kKHVRvusAbQp",
+        "outputId": "567406a4-5c88-4d77-82b1-ddaa6caad362"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[ 0.0000,  1.0000,  0.0000,  1.0000,  0.0000,  1.0000],\n",
+              "        [ 0.8415,  0.5403,  0.0464,  0.9989,  0.0022,  1.0000],\n",
+              "        [ 0.9093, -0.4161,  0.0927,  0.9957,  0.0043,  1.0000],\n",
+              "        [ 0.1411, -0.9900,  0.1388,  0.9903,  0.0065,  1.0000],\n",
+              "        [-0.7568, -0.6536,  0.1846,  0.9828,  0.0086,  1.0000],\n",
+              "        [-0.9589,  0.2837,  0.2300,  0.9732,  0.0108,  0.9999],\n",
+              "        [-0.2794,  0.9602,  0.2749,  0.9615,  0.0129,  0.9999],\n",
+              "        [ 0.6570,  0.7539,  0.3192,  0.9477,  0.0151,  0.9999],\n",
+              "        [ 0.9894, -0.1455,  0.3629,  0.9318,  0.0172,  0.9999],\n",
+              "        [ 0.4121, -0.9111,  0.4057,  0.9140,  0.0194,  0.9998]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 14
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "3d62fb36"
+      },
+      "source": [
+        "This code defines a PyTorch `nn.Module` called `PositionalEncoding`. This module is commonly used in Transformer models to inject information about the position of tokens in a sequence.\n",
+        "\n",
+        "Here's a breakdown:\n",
+        "\n",
+        "- **`__init__(self, d_model, max_sequence_length)`**:\n",
+        "  - This is the constructor of the class.\n",
+        "  - It takes `d_model` (the dimension of the model's embeddings) and `max_sequence_length` as input.\n",
+        "  - It initializes these values as instance variables.\n",
+        "\n",
+        "- **`forward(self)`**:\n",
+        "  - This method computes the positional encodings.\n",
+        "  - `even_i` and `odd_i`: These tensors represent the indices for the even and odd dimensions of the positional encoding vector.\n",
+        "  - `denominator`: This calculates the denominator for the positional encoding formula, which involves a power of 10000.\n",
+        "  - `position`: This tensor represents the positions of the tokens in the sequence.\n",
+        "  - `even_PE` and `odd_PE`: These calculate the positional encodings for the even and odd dimensions using the sine and cosine functions, respectively.\n",
+        "  - `stacked`: This stacks the even and odd positional encodings along a new dimension.\n",
+        "  - `PE`: This flattens the stacked tensor to get the final positional encoding matrix.\n",
+        "  - The method returns the `PE` tensor."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "\n",
+        "class PositionalEncoding(nn.Module):\n",
+        "\n",
+        "    def __init__(self, d_model, max_sequence_length):\n",
+        "        super().__init__()\n",
+        "        self.max_sequence_length = max_sequence_length\n",
+        "        self.d_model = d_model\n",
+        "\n",
+        "    def forward(self):\n",
+        "        even_i = torch.arange(0, self.d_model, 2).float()\n",
+        "        denominator = torch.pow(10000, even_i/self.d_model)\n",
+        "        position = torch.arange(self.max_sequence_length).reshape(self.max_sequence_length, 1)\n",
+        "        even_PE = torch.sin(position / denominator)\n",
+        "        odd_PE = torch.cos(position / denominator)\n",
+        "        stacked = torch.stack([even_PE, odd_PE], dim=2)\n",
+        "        PE = torch.flatten(stacked, start_dim=1, end_dim=2)\n",
+        "        return PE"
+      ],
+      "metadata": {
+        "id": "1VyRvtVhBK46"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "pe = PositionalEncoding(d_model=6, max_sequence_length=10)\n",
+        "pe.forward()"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "3eYTPwnaBSqK",
+        "outputId": "efd59294-f7d9-429b-d4cb-faecfd795800"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "tensor([[ 0.0000,  1.0000,  0.0000,  1.0000,  0.0000,  1.0000],\n",
+              "        [ 0.8415,  0.5403,  0.0464,  0.9989,  0.0022,  1.0000],\n",
+              "        [ 0.9093, -0.4161,  0.0927,  0.9957,  0.0043,  1.0000],\n",
+              "        [ 0.1411, -0.9900,  0.1388,  0.9903,  0.0065,  1.0000],\n",
+              "        [-0.7568, -0.6536,  0.1846,  0.9828,  0.0086,  1.0000],\n",
+              "        [-0.9589,  0.2837,  0.2300,  0.9732,  0.0108,  0.9999],\n",
+              "        [-0.2794,  0.9602,  0.2749,  0.9615,  0.0129,  0.9999],\n",
+              "        [ 0.6570,  0.7539,  0.3192,  0.9477,  0.0151,  0.9999],\n",
+              "        [ 0.9894, -0.1455,  0.3629,  0.9318,  0.0172,  0.9999],\n",
+              "        [ 0.4121, -0.9111,  0.4057,  0.9140,  0.0194,  0.9998]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 17
+        }
+      ]
+    }
+  ]
+}
+===== SelfAttention (1).ipynb =====
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "75c8aaf8"
+      },
+      "source": [
+        "### Import Libraries\n",
+        "\n",
+        "This cell imports the necessary libraries: `numpy` for numerical operations and `math` for mathematical functions."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "TZlsUgRCqcmi"
+      },
+      "outputs": [],
+      "source": [
+        "import numpy as np\n",
+        "import math"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "42579c4a"
+      },
+      "source": [
+        "### Initialize Variables\n",
+        "\n",
+        "This cell initializes the variables `L`, `d_k`, and `d_v` which represent the sequence length and the dimensions of the key and value vectors, respectively. It also creates random query, key, and value matrices (`q`, `k`, and `v`)."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "L, d_k, d_v = 4, 8, 8\n",
+        "q = np.random.randn(L, d_k)\n",
+        "k = np.random.randn(L, d_k)\n",
+        "v = np.random.randn(L, d_v)"
+      ],
+      "metadata": {
+        "id": "GmCUxZnKumnC"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "5691d1e2"
+      },
+      "source": [
+        "### Print Q, K, and V\n",
+        "\n",
+        "This cell prints the initialized query (`q`), key (`k`), and value (`v`) matrices."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "print(\"Q\\n\", q)\n",
+        "print(\"K\\n\", k)\n",
+        "print(\"V\\n\", v)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "7BJClsnlusK7",
+        "outputId": "476e1f0d-1b2d-49c2-b0aa-d18728aa39de"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Q\n",
+            " [[-0.23303838  0.4552888   0.95491234  0.30506956  0.32863433 -0.21465489\n",
+            "  -1.99278369  0.6920726 ]\n",
+            " [-0.66801934 -0.47584393  0.02423653 -2.02101804  0.660781   -0.64228401\n",
+            "  -0.73995386  0.51579461]\n",
+            " [-1.23958879 -1.38750281 -0.31920982 -1.50463355  1.96619006  1.4805927\n",
+            "  -0.09300824 -1.00037272]\n",
+            " [ 1.01917479  1.15913976  0.10872518 -0.1800475  -0.55870587  1.37986459\n",
+            "   2.6599079   0.04387907]]\n",
+            "K\n",
+            " [[-0.96900161 -1.12374365 -1.26487243  0.53755025 -1.35861454  0.65570976\n",
+            "  -1.15999351  0.12286737]\n",
+            " [-0.06005638 -0.16036109 -0.74406779 -1.29358825 -0.56232546  0.49575063\n",
+            "   0.877804   -0.32933588]\n",
+            " [ 0.17975888  0.95998137  1.42153112 -1.41099863 -0.48974893  0.28141373\n",
+            "   0.07628394  0.40003283]\n",
+            " [ 2.07843739  1.33156505 -0.28815526 -1.24923639  1.09823374 -0.39904121\n",
+            "   1.00280328 -0.77046439]]\n",
+            "V\n",
+            " [[-0.14568428  0.31482634  0.69393521  0.22385512  1.89562802  0.16136048\n",
+            "   0.530136   -1.01611595]\n",
+            " [-0.92017587 -0.75384648 -0.96106     0.22128155  2.16263508 -0.4784105\n",
+            "   0.60419382 -1.71237406]\n",
+            " [-0.02587124  1.53731072  0.636442    0.1246209   0.40339543  0.42203736\n",
+            "  -0.20485709  2.02804858]\n",
+            " [-1.99003486 -0.84010627  0.46174786 -0.49680789 -0.89477834 -0.22835937\n",
+            "   0.5336981  -0.0690319 ]]\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "c0f52bcc"
+      },
+      "source": [
+        "### Calculate Dot Product of Q and K Transpose\n",
+        "\n",
+        "This cell calculates the dot product of the query matrix (`q`) and the transpose of the key matrix (`k.T`). This is a crucial step in the self-attention mechanism."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "np.matmul(q,k.T)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "8je8ob6cvBwm",
+        "outputId": "4c75da2a-a8c3-4a4a-abf1-4ad8fb5e3055"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[ 0.47974519, -3.43258167,  1.22564215, -2.6193899 ],\n",
+              "       [-0.33219901,  1.20336642,  1.9547468 ,  0.33825211],\n",
+              "       [ 0.63982505,  2.35701837, -0.83909208, -0.20633162],\n",
+              "       [-3.94069403,  3.22358971,  2.58696108,  5.32469779]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 5
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "9fd83aef"
+      },
+      "source": [
+        "### Calculate Variance of Q, K, and the Dot Product\n",
+        "\n",
+        "This cell calculates and prints the variance of the query matrix (`q`), the key matrix (`k`), and the result of the dot product of `q` and `k.T`. This helps to understand the spread of values in these matrices."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "q.var(), k.var(), np.matmul(q,k.T).var()"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "DgepNLnCvTw1",
+        "outputId": "a3e7e1b5-afe1-4ac7-d133-e3bb60781675"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "(np.float64(1.1530857762373627),\n",
+              " np.float64(0.857386828919557),\n",
+              " np.float64(5.598960354561339))"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 6
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "8240e5f3"
+      },
+      "source": [
+        "### Scale the Dot Product\n",
+        "\n",
+        "This cell scales the dot product of `q` and `k.T` by dividing it by the square root of `d_k`. This scaling is done to prevent the dot product from becoming too large, which can lead to vanishing gradients during training. It also prints the variance of the scaled matrix."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "scaled = np.matmul(q,k.T) / math.sqrt(d_k)\n",
+        "q.var(), k.var(), scaled.var()"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "6YaEvHVjviJV",
+        "outputId": "f72bfdb3-cd20-47d6-97c8-0e4f44dc72ad"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "(np.float64(1.1530857762373627),\n",
+              " np.float64(0.857386828919557),\n",
+              " np.float64(0.6998700443201673))"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 7
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "3e5ad88d"
+      },
+      "source": [
+        "### Print Scaled Matrix\n",
+        "\n",
+        "This cell prints the scaled dot product matrix."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "scaled"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "7xmuTlbJvxp1",
+        "outputId": "5ebdb2cc-7c18-4afb-d651-17e71297442e"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[ 0.16961554, -1.21360089,  0.43332994, -0.92609418],\n",
+              "       [-0.11745009,  0.42545428,  0.69110736,  0.11959018],\n",
+              "       [ 0.22621232,  0.83333184, -0.29666385, -0.07294924],\n",
+              "       [-1.39324573,  1.13971107,  0.91462886,  1.88256496]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 8
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "3cac626f"
+      },
+      "source": [
+        "### Create a Lower Triangular Mask\n",
+        "\n",
+        "This cell creates a lower triangular mask using `np.tril` with dimensions `L x L`. This mask is used in masked self-attention to prevent attending to future tokens."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mask = np.tril(np.ones(( L,L )))\n",
+        "mask"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "89qS-yx3v2pt",
+        "outputId": "958f509d-f4ba-4261-af11-e8c50f45c0a2"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[1., 0., 0., 0.],\n",
+              "       [1., 1., 0., 0.],\n",
+              "       [1., 1., 1., 0.],\n",
+              "       [1., 1., 1., 1.]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 16
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "f1c1a9e5"
+      },
+      "source": [
+        "### Modify the Mask\n",
+        "\n",
+        "This cell modifies the mask so that the lower triangle contains 0s and the upper triangle contains negative infinity (`-np.inf`). This is done so that when the mask is added to the scaled attention scores, the softmax function will output 0 for the masked values."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mask[mask == 0] = -np.inf\n",
+        "mask[mask == 1] = 0\n",
+        "\n",
+        "mask"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "cIMhR6GNwJ3k",
+        "outputId": "512fa749-ee4a-460f-f3af-e80367fa4693"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[  0., -inf, -inf, -inf],\n",
+              "       [  0.,   0., -inf, -inf],\n",
+              "       [  0.,   0.,   0., -inf],\n",
+              "       [  0.,   0.,   0.,   0.]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 17
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "8ed16936"
+      },
+      "source": [
+        "### Add Mask to Scaled Matrix\n",
+        "\n",
+        "This cell adds the modified mask to the scaled dot product matrix. The negative infinity values in the mask will effectively mask out the corresponding values in the scaled matrix."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mask += scaled\n",
+        "mask"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "aatYZeZJwkBF",
+        "outputId": "f24512a0-ea87-4956-c8ac-b8eb8c574881"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[ 0.33923108,        -inf,        -inf,        -inf],\n",
+              "       [-0.23490017,  0.85090856,        -inf,        -inf],\n",
+              "       [ 0.45242463,  1.66666367, -0.5933277 ,        -inf],\n",
+              "       [-2.78649147,  2.27942214,  1.82925772,  3.76512991]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 19
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "94d13a13"
+      },
+      "source": [
+        "### Define Softmax Function\n",
+        "\n",
+        "This cell defines a `softmax` function that takes a matrix `x` as input and applies the softmax function along the last axis. The softmax function is used to convert the attention scores into attention weights."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def softmax(x):\n",
+        "  return (np.exp(x).T / np.sum(np.exp(x), axis =-1)).T"
+      ],
+      "metadata": {
+        "id": "JNfqwXviwpPU"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "b48ab44b"
+      },
+      "source": [
+        "### Calculate Attention Weights\n",
+        "\n",
+        "This cell applies the `softmax` function to the masked and scaled dot product matrix to obtain the attention weights."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "attention = softmax(scaled + mask)\n",
+        "attention"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "l75RMORNyDeM",
+        "outputId": "155cdfa9-28d1-414f-834f-541cf90118b0"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[1.00000000e+00, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00],\n",
+              "       [1.64006731e-01, 8.35993269e-01, 0.00000000e+00, 0.00000000e+00],\n",
+              "       [1.35344010e-01, 8.36459676e-01, 2.81963139e-02, 0.00000000e+00],\n",
+              "       [4.64075221e-05, 9.26266314e-02, 4.71498140e-02, 8.60177147e-01]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 21
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "5da7e079"
+      },
+      "source": [
+        "### Calculate New Value Matrix\n",
+        "\n",
+        "This cell calculates the final output of the self-attention layer by multiplying the attention weights with the value matrix (`v`)."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "new_v = np.matmul(attention, v)\n",
+        "new_v"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "_p3TmBipyL5M",
+        "outputId": "9f2371e4-6907-473e-c37a-607c93fa0ee5"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[-0.14568428,  0.31482634,  0.69393521,  0.22385512,  1.89562802,\n",
+              "         0.16136048,  0.530136  , -1.01611595],\n",
+              "       [-0.79315404, -0.57857694, -0.68962964,  0.22170364,  2.11884413,\n",
+              "        -0.37348375,  0.59204784, -1.59818304],\n",
+              "       [-0.79013698, -0.54460583, -0.69202264,  0.2189044 ,  2.0768932 ,\n",
+              "        -0.36643202,  0.57135829, -1.51267357],\n",
+              "       [-1.79824188, -0.71996795,  0.33820553, -0.40095999, -0.55024229,\n",
+              "        -0.22083659,  0.50540498, -0.12241615]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 22
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "v"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "6fleGyz5z-EL",
+        "outputId": "4b321610-2a16-4b1f-f5c5-df2500687475"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "array([[-0.14568428,  0.31482634,  0.69393521,  0.22385512,  1.89562802,\n",
+              "         0.16136048,  0.530136  , -1.01611595],\n",
+              "       [-0.92017587, -0.75384648, -0.96106   ,  0.22128155,  2.16263508,\n",
+              "        -0.4784105 ,  0.60419382, -1.71237406],\n",
+              "       [-0.02587124,  1.53731072,  0.636442  ,  0.1246209 ,  0.40339543,\n",
+              "         0.42203736, -0.20485709,  2.02804858],\n",
+              "       [-1.99003486, -0.84010627,  0.46174786, -0.49680789, -0.89477834,\n",
+              "        -0.22835937,  0.5336981 , -0.0690319 ]])"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 23
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def softmax(x):\n",
+        "  return (np.exp(x).T / np.sum(np.exp(x), axis =-1)).T\n",
+        "\n",
+        "def scaled_dot_product_attention(q, k, v, mask=None):\n",
+        "  d_k = q.shape[-1]\n",
+        "  scaled = np.matmul(q, k.T) / math.sqrt(d_k)\n",
+        "  if mask is not None:\n",
+        "    scaled += mask\n",
+        "  attention = softmax(scaled)\n",
+        "  out = np.matmul(attention, v)\n",
+        "  return out, attention"
+      ],
+      "metadata": {
+        "id": "2FW_QsyN5wwx"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "values, attention = scaled_dot_product_attention(q, k, v, mask=mask)\n",
+        "print(\"Q\\n\", q)\n",
+        "print(\"K\\n\", k)\n",
+        "print(\"V\\n\", v)\n",
+        "print(\"New V\\n\", values)\n",
+        "print(\"Attention\\n\", attention)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "K1YTbRH66Pl5",
+        "outputId": "36464f30-503e-4788-fbef-14fa5dd7f144"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Q\n",
+            " [[-0.23303838  0.4552888   0.95491234  0.30506956  0.32863433 -0.21465489\n",
+            "  -1.99278369  0.6920726 ]\n",
+            " [-0.66801934 -0.47584393  0.02423653 -2.02101804  0.660781   -0.64228401\n",
+            "  -0.73995386  0.51579461]\n",
+            " [-1.23958879 -1.38750281 -0.31920982 -1.50463355  1.96619006  1.4805927\n",
+            "  -0.09300824 -1.00037272]\n",
+            " [ 1.01917479  1.15913976  0.10872518 -0.1800475  -0.55870587  1.37986459\n",
+            "   2.6599079   0.04387907]]\n",
+            "K\n",
+            " [[-0.96900161 -1.12374365 -1.26487243  0.53755025 -1.35861454  0.65570976\n",
+            "  -1.15999351  0.12286737]\n",
+            " [-0.06005638 -0.16036109 -0.74406779 -1.29358825 -0.56232546  0.49575063\n",
+            "   0.877804   -0.32933588]\n",
+            " [ 0.17975888  0.95998137  1.42153112 -1.41099863 -0.48974893  0.28141373\n",
+            "   0.07628394  0.40003283]\n",
+            " [ 2.07843739  1.33156505 -0.28815526 -1.24923639  1.09823374 -0.39904121\n",
+            "   1.00280328 -0.77046439]]\n",
+            "V\n",
+            " [[-0.14568428  0.31482634  0.69393521  0.22385512  1.89562802  0.16136048\n",
+            "   0.530136   -1.01611595]\n",
+            " [-0.92017587 -0.75384648 -0.96106     0.22128155  2.16263508 -0.4784105\n",
+            "   0.60419382 -1.71237406]\n",
+            " [-0.02587124  1.53731072  0.636442    0.1246209   0.40339543  0.42203736\n",
+            "  -0.20485709  2.02804858]\n",
+            " [-1.99003486 -0.84010627  0.46174786 -0.49680789 -0.89477834 -0.22835937\n",
+            "   0.5336981  -0.0690319 ]]\n",
+            "New V\n",
+            " [[-0.14568428  0.31482634  0.69393521  0.22385512  1.89562802  0.16136048\n",
+            "   0.530136   -1.01611595]\n",
+            " [-0.79315404 -0.57857694 -0.68962964  0.22170364  2.11884413 -0.37348375\n",
+            "   0.59204784 -1.59818304]\n",
+            " [-0.79013698 -0.54460583 -0.69202264  0.2189044   2.0768932  -0.36643202\n",
+            "   0.57135829 -1.51267357]\n",
+            " [-1.79824188 -0.71996795  0.33820553 -0.40095999 -0.55024229 -0.22083659\n",
+            "   0.50540498 -0.12241615]]\n",
+            "Attention\n",
+            " [[1.00000000e+00 0.00000000e+00 0.00000000e+00 0.00000000e+00]\n",
+            " [1.64006731e-01 8.35993269e-01 0.00000000e+00 0.00000000e+00]\n",
+            " [1.35344010e-01 8.36459676e-01 2.81963139e-02 0.00000000e+00]\n",
+            " [4.64075221e-05 9.26266314e-02 4.71498140e-02 8.60177147e-01]]\n"
+          ]
+        }
+      ]
+    }
+  ]
+}
